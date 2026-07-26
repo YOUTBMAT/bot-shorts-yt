@@ -1,6 +1,7 @@
-google-generativeai
+google-genai
 elevenlabs
 moviepy==1.0.3
 google-api-python-client
 google-auth-httplib2
 google-auth-oauthlib
+Pillow==9.5.0
