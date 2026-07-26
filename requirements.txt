@@ -1,0 +1,6 @@
+moviepy==1.0.3
+pillow==9.5.0
+elevenlabs==1.9.0
+google-generativeai
+google-api-python-client
+google-auth-oauthlib
