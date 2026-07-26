@@ -49,7 +49,7 @@ def gerar_audio(texto, caminho_saida="narracao.mp3"):
     client = ElevenLabs(api_key=os.environ.get("ELEVENLABS_API_KEY"))
     
     audio_stream = client.text_to_speech.convert(
-        voice_id="21m00Tcm4TlvDq8ikWAM", # Voz Rachel / PT-BR
+        voice_id="pNInz6obpgDQGcFmaJgB", # Voz Adam (Padrao / PT-BR)
         text=texto,
         model_id="eleven_multilingual_v2"
     )
