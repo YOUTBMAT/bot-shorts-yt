@@ -25,9 +25,9 @@ def gerar_roteiro():
     
     # Uso do modelo gemini-1.5-flash com saída forçada em JSON
     model = genai.GenerativeModel(
-        'gemini-1.5-flash',
-        generation_config={"response_mime_type": "application/json"}
-    )
+    'gemini-1.5-flash-latest',
+    generation_config={"response_mime_type": "application/json"}
+)
 
     prompt = """
     Gere UMA curiosidade fascinante, rápida e impressionante sobre ciência, espaço, história ou natureza para um vídeo curto.
