@@ -1,6 +1,7 @@
 import os
 import json
 import random
+import math
 import google.generativeai as genai
 from elevenlabs.client import ElevenLabs
 from moviepy.editor import (
@@ -10,19 +11,18 @@ from moviepy.editor import (
     CompositeVideoClip, 
     CompositeAudioClip
 )
-from moviepy.audio.fx.all import audio_fadeout, volumex
 from googleapiclient.discovery import build
 from google.oauth2.credentials import Credentials
 from googleapiclient.http import MediaFileUpload
 
-# 1. ROTEIRO COM GEMINI (Usa alias dinâmico + Modo JSON nativo)
+# 1. ROTEIRO COM GEMINI (JSON Nativo + Modelo Atualizado)
 def gerar_roteiro():
     print("🧠 [1/4] Gerando roteiro inédito com o Gemini...")
     api_key = os.environ.get("GEMINI_API_KEY")
     genai.configure(api_key=api_key)
     
     model = genai.GenerativeModel(
-        'gemini-flash-latest',
+        'gemini-2.5-flash',
         generation_config={"response_mime_type": "application/json"}
     )
 
@@ -43,13 +43,13 @@ def gerar_roteiro():
     dados = json.loads(resposta.text.strip())
     return dados["titulo"], dados["roteiro"]
 
-# 2. ÁUDIO COM ELEVENLABS (SDK 1.x / Generator)
+# 2. ÁUDIO COM ELEVENLABS (Voz Padrão Gratuita)
 def gerar_audio(texto, caminho_saida="narracao.mp3"):
     print("🎙️ [2/4] Gerando voz ultra-realista com a ElevenLabs...")
     client = ElevenLabs(api_key=os.environ.get("ELEVENLABS_API_KEY"))
     
     audio_stream = client.text_to_speech.convert(
-        voice_id="pNInz6obpgDQGcFmaJgB", # Voz Adam (Padrao / PT-BR)
+        voice_id="pNInz6obpgDQGcFmaJgB", # Voz Adam (Padrão universal / PT-BR)
         text=texto,
         model_id="eleven_multilingual_v2"
     )
@@ -60,71 +60,90 @@ def gerar_audio(texto, caminho_saida="narracao.mp3"):
                 f.write(chunk)
     return caminho_saida
 
-# 3. RENDERIZAR VÍDEO COM MOVIEPY + MIXAGEM DE ÁUDIO
-def criar_video(texto, arquivo_audio, fundo_mp4="fundo.mp4", musica_mp3="musica.mp3", saida="video_final.mp4"):
-    print("🎬 [3/4] Renderizando o vídeo vertical, legendas e mixagem de áudio...")
+# 3. RENDERIZAR VÍDEO COM LEGENDA DINÂMICA E DESIGN PRO
+def criar_video(roteiro_completo, caminho_audio, caminho_video_fundo, caminho_saida="video_final.mp4"):
+    print(f"🎬 [3/4] Montando vídeo final com legendas dinâmicas e design pro...")
     
-    # --- ÁUDIOS ---
-    narracao_clip = AudioFileClip(arquivo_audio)
-    duracao = narracao_clip.duration
-
-    if os.path.exists(musica_mp3):
-        musica_clip = AudioFileClip(musica_mp3)
+    # --- CONFIGURAÇÕES DE DESIGN ---
+    FONT_NAME = "Arial-Bold" # Fonte destacada e legível
+    FONT_SIZE = 65          # Tamanho proporcional
+    COLOR_TEXT = "yellow"    # Amarelo vibrante
+    STROKE_COLOR = "black"  # Contorno preto sutil
+    STROKE_WIDTH = 2        # Espessura do contorno
+    
+    # 1. Carregar Vídeo de Fundo e Áudio
+    clip_video = VideoFileClip(caminho_video_fundo)
+    clip_audio = AudioFileClip(caminho_audio)
+    
+    # Ajustar duração do fundo para o tempo exato do áudio
+    final_duration = clip_audio.duration
+    clip_video = clip_video.subclip(0, final_duration)
+    
+    # --- REDIMENSIONAMENTO E CROP (Preenche 9:16 sem esticar) ---
+    w, h = clip_video.size
+    target_ratio = 9/16
+    
+    if w/h > target_ratio: # Vídeo mais largo que 9:16
+        new_w = h * target_ratio
+        clip_video = clip_video.crop(x1=(w-new_w)/2, y1=0, width=new_w, height=h)
+    else: # Vídeo mais alto que 9:16
+        new_h = w / target_ratio
+        clip_video = clip_video.crop(x1=0, y1=(h-new_h)/2, width=w, height=new_h)
         
-        max_inicio_musica = max(0, musica_clip.duration - duracao)
-        inicio_musica = random.uniform(0, max_inicio_musica) if max_inicio_musica > 0 else 0
+    clip_video = clip_video.resize(width=1080)
+    final_w, final_h = clip_video.size
+
+    # 2. Processar Legendas Dinâmicas (Em blocos pequenos)
+    palavras = roteiro_completo.split()
+    tamanho_bloco = 5 # 5 palavras por exibição
+    blocos_texto = []
+    for i in range(0, len(palavras), tamanho_bloco):
+        bloco = " ".join(palavras[i : i + tamanho_bloco])
+        blocos_texto.append(bloco)
+
+    num_blocos = len(blocos_texto)
+    duration_per_block = final_duration / num_blocos
+    
+    text_clips = []
+    
+    for i, texto in enumerate(blocos_texto):
+        start_time = i * duration_per_block
         
-        if musica_clip.duration < duracao:
-            musica_clip = musica_clip.loop(duration=duracao)
-        else:
-            musica_clip = musica_clip.subclip(inicio_musica, inicio_musica + duracao)
-            
-        # Reduz o volume da música para 12% e aplica fade-out nos últimos 1.5s
-        musica_clip = volumex(musica_clip, 0.12)
-        musica_clip = audio_fadeout(musica_clip, 1.5)
+        txt_clip = TextClip(
+            texto,
+            fontsize=FONT_SIZE,
+            font=FONT_NAME,
+            color=COLOR_TEXT,
+            stroke_color=STROKE_COLOR,
+            stroke_width=STROKE_WIDTH,
+            method='caption',
+            size=(final_w * 0.8, None),
+            align='center',
+            interline=10
+        )
         
-        audio_final = CompositeAudioClip([narracao_clip, musica_clip])
-    else:
-        print("⚠️ [Aviso] musica.mp3 não encontrada. Gerando vídeo apenas com a narração.")
-        audio_final = narracao_clip
+        txt_clip = txt_clip.set_start(start_time).set_duration(duration_per_block)
+        txt_clip = txt_clip.set_position(('center', 0.55), relative=True)
+        txt_clip = txt_clip.crossfadein(0.15).crossfadeout(0.15)
+        
+        text_clips.append(txt_clip)
 
-    # --- VÍDEO DE FUNDO (Corte Aleatório) ---
-    video_fundo = VideoFileClip(fundo_mp4)
+    # 3. Composição Final
+    video_final = CompositeVideoClip([clip_video] + text_clips)
+    video_final = video_final.set_audio(clip_audio)
     
-    max_inicio_video = max(0, video_fundo.duration - duracao)
-    inicio_video = random.uniform(0, max_inicio_video) if max_inicio_video > 0 else 0
+    print("⏳ Renderizando vídeo...")
+    video_final.write_videofile(
+        caminho_saida,
+        codec="libx264",
+        audio_codec="aac",
+        threads=4,
+        logger=None
+    )
     
-    if video_fundo.duration < duracao:
-        video_fundo = video_fundo.loop(duration=duracao)
-    else:
-        video_fundo = video_fundo.subclip(inicio_video, inicio_video + duracao)
+    return caminho_saida
 
-    video_fundo = video_fundo.resize((1080, 1920))
-
-    # --- LEGENDAS ---
-    txt_clip = TextClip(
-        texto,
-        fontsize=48,
-        color='yellow',
-        font='DejaVu-Sans-Bold',
-        method='caption',
-        size=(850, None),
-        align='center',
-        bg_color='black'
-    ).set_position(('center', 0.4), relative=True).set_duration(duracao)
-
-    # --- MONTAGEM FINAL ---
-    video_final = CompositeVideoClip([video_fundo, txt_clip]).set_audio(audio_final)
-    video_final.write_videofile(saida, fps=30, codec="libx264", audio_codec="aac")
-
-    narracao_clip.close()
-    if os.path.exists(musica_mp3):
-        musica_clip.close()
-    video_fundo.close()
-    
-    return saida
-
-# 4. UPLOAD PARA YOUTUBE
+# 4. UPLOAD AUTOMÁTICO PARA O YOUTUBE
 def upload_youtube(caminho_video, titulo):
     print("🚀 [4/4] Enviando o vídeo para o YouTube Shorts...")
     token_json_str = os.environ.get("YOUTUBE_TOKEN_JSON")
@@ -138,7 +157,7 @@ def upload_youtube(caminho_video, titulo):
             'title': titulo,
             'description': 'Curiosidade rápida gerada automaticamente! #shorts #curiosidades',
             'tags': ['shorts', 'curiosidades', 'viral'],
-            'categoryId': '27' # Categoria Educação
+            'categoryId': '27'
         },
         'status': {
             'privacyStatus': 'public',
@@ -151,11 +170,16 @@ def upload_youtube(caminho_video, titulo):
     resposta = request.execute()
     print(f"✅ Sucesso! Vídeo publicado com o ID: {resposta['id']}")
 
+# --- EXECUÇÃO PRINCIPAL ---
 if __name__ == "__main__":
     try:
         titulo, roteiro = gerar_roteiro()
         audio_path = gerar_audio(roteiro)
-        video_path = criar_video(roteiro, audio_path)
+        
+        # ⚠️ Certifique-se de que o arquivo "fundo.mp4" existe no seu repositório
+        video_fundo = "fundo.mp4" 
+        
+        video_path = criar_video(roteiro, audio_path, video_fundo)
         upload_youtube(video_path, titulo)
         
         if os.path.exists("narracao.mp3"):
