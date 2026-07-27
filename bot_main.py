@@ -22,8 +22,6 @@ from googleapiclient.http import MediaFileUpload
 def gerar_roteiro():
     print("🧠 [1/4] Gerando roteiro inédito com o Gemini...")
     api_key = os.environ.get("GEMINI_API_KEY")
-    
-    # Inicializa o cliente moderno da SDK google-genai
     client = genai.Client(api_key=api_key)
 
     prompt = """
@@ -39,13 +37,28 @@ def gerar_roteiro():
     {"titulo": "O silêncio do espaço #shorts", "roteiro": "Você sabia que o espaço é totalmente silencioso? Como não existe ar para transportar as ondas sonoras, o som não consegue se propagar!"}
     """
 
-    resposta = client.models.generate_content(
-        model='gemini-2.0-flash',
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json"
-        )
-    )
+    # Modelos EXATOS que aparecem ativos no seu painel
+    modelos = ['gemini-2.5-flash', 'gemini-3.6-flash']
+    
+    resposta = None
+    for mod in modelos:
+        try:
+            print(f"🔄 Tentando gerar com o modelo: {mod}...")
+            resposta = client.models.generate_content(
+                model=mod,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json"
+                )
+            )
+            print(f"✅ Sucesso utilizando {mod}!")
+            break
+        except Exception as err:
+            print(f"⚠️ Erro ao usar {mod}: {err}")
+            continue
+
+    if not resposta or not resposta.text:
+        raise Exception("Não foi possível gerar o roteiro com nenhum dos modelos disponíveis.")
 
     dados = json.loads(resposta.text.strip())
     return dados["titulo"], dados["roteiro"]
