@@ -17,7 +17,7 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.http import MediaFileUpload
 
 # ---------------------------------------------------------------------------
-# 1. GERAR ROTEIRO (Gemini SDK Nova)
+# 1. GERAR ROTEIRO (Gemini SDK Nova - ~30 Segundos)
 # ---------------------------------------------------------------------------
 def gerar_roteiro():
     print("🧠 [1/4] Gerando roteiro inédito com o Gemini...")
@@ -25,19 +25,18 @@ def gerar_roteiro():
     client = genai.Client(api_key=api_key)
 
     prompt = """
-    Gere UMA curiosidade fascinante, rápida e impressionante sobre ciência, espaço, história ou natureza para um vídeo curto.
+    Gere UMA curiosidade fascinante, detalhada e impressionante sobre ciência, espaço, história ou natureza para um vídeo curto do YouTube Shorts.
     
     REGRAS OBRIGATÓRIAS:
-    1. Texto direto, sem saudações.
-    2. Entre 25 e 35 palavras no máximo.
-    3. Comece com um gancho forte ("Você sabia que...", "Existe algo incrível...").
+    1. Texto direto, sem saudações ou "bem-vindos".
+    2. O roteiro deve ter entre 65 e 85 palavras para garantir um vídeo de ~30 segundos.
+    3. Comece com um gancho muito forte ("Você sabia que...", "Existe um fenômeno inacreditável...").
     4. Responda ESTRITAMENTE em formato JSON válido com as chaves "titulo" e "roteiro".
 
     Exemplo:
-    {"titulo": "O silêncio do espaço #shorts", "roteiro": "Você sabia que o espaço é totalmente silencioso? Como não existe ar para transportar as ondas sonoras, o som não consegue se propagar!"}
+    {"titulo": "O mistério do espaço em silêncio #shorts", "roteiro": "Você sabia que o espaço é totalmente silencioso? Como não existe ar para transportar as ondas sonoras, mesmo as explosões mais gigantescas no universo acontecem em absoluto silêncio. Se você estivesse no meio de uma super nova, não ouviria absolutamente nada! Isso acontece porque o som precisa de um meio físico como o ar ou a água para se propagar."}
     """
 
-    # Modelos EXATOS que aparecem ativos no seu painel
     modelos = ['gemini-2.5-flash', 'gemini-3.6-flash']
     
     resposta = None
@@ -71,7 +70,7 @@ def gerar_audio(texto, caminho_saida="narracao.mp3"):
     client = ElevenLabs(api_key=os.environ.get("ELEVENLABS_API_KEY"))
     
     audio_stream = client.text_to_speech.convert(
-        voice_id="pNInz6obpgDQGcFmaJgB", # Voz Adam (Padrao universal no plano free)
+        voice_id="pNInz6obpgDQGcFmaJgB", # Voz Adam
         text=texto,
         model_id="eleven_multilingual_v2"
     )
@@ -88,7 +87,6 @@ def gerar_audio(texto, caminho_saida="narracao.mp3"):
 def criar_video(roteiro_completo, caminho_audio, caminho_video_fundo, caminho_saida="video_final.mp4"):
     print(f"🎬 [3/4] Montando vídeo final com legendas dinâmicas e design pro...")
     
-    # Usa DejaVu-Sans-Bold, garantida e nativa no Linux do GitHub Actions
     FONT_NAME = "DejaVu-Sans-Bold"
     FONT_SIZE = 65
     COLOR_TEXT = "yellow"
@@ -99,9 +97,17 @@ def criar_video(roteiro_completo, caminho_audio, caminho_video_fundo, caminho_sa
     clip_audio = AudioFileClip(caminho_audio)
     
     final_duration = clip_audio.duration
+    
+    # Loop do vídeo de fundo se o áudio for mais longo que o vídeo original
+    if clip_video.duration < final_duration:
+        num_loops = math.ceil(final_duration / clip_video.duration)
+        clips = [clip_video] * num_loops
+        from moviepy.editor import concatenate_videoclips
+        clip_video = concatenate_videoclips(clips)
+        
     clip_video = clip_video.subclip(0, final_duration)
     
-    # Redimensionamento e Crop 9:16 sem esticar
+    # Redimensionamento e Crop 9:16
     w, h = clip_video.size
     target_ratio = 9/16
     
@@ -165,9 +171,9 @@ def criar_video(roteiro_completo, caminho_audio, caminho_video_fundo, caminho_sa
     return caminho_saida
 
 # ---------------------------------------------------------------------------
-# 4. UPLOAD YOUTUBE
+# 4. UPLOAD YOUTUBE (Descrição Otimizada)
 # ---------------------------------------------------------------------------
-def upload_youtube(caminho_video, titulo):
+def upload_youtube(caminho_video, titulo, roteiro):
     print("🚀 [4/4] Enviando o vídeo para o YouTube Shorts...")
     token_json_str = os.environ.get("YOUTUBE_TOKEN_JSON")
     info_token = json.loads(token_json_str)
@@ -175,11 +181,13 @@ def upload_youtube(caminho_video, titulo):
     credentials = Credentials.from_authorized_user_info(info_token)
     youtube = build('youtube', 'v3', credentials=credentials)
 
+    descricao = f"{roteiro}\n\n💡 Gostou dessa curiosidade? Inscreva-se no canal para acompanhar mais vídeos diários!\n\n#shorts #curiosidades #fatos #ciencia #conhecimento"
+
     body = {
         'snippet': {
             'title': titulo,
-            'description': 'Curiosidade rápida gerada automaticamente! #shorts #curiosidades',
-            'tags': ['shorts', 'curiosidades', 'viral'],
+            'description': descricao,
+            'tags': ['shorts', 'curiosidades', 'fatos interessantes', 'ciencia', 'viral'],
             'categoryId': '27'
         },
         'status': {
@@ -203,7 +211,7 @@ if __name__ == "__main__":
         video_fundo = "fundo.mp4" 
         
         video_path = criar_video(roteiro, audio_path, video_fundo)
-        upload_youtube(video_path, titulo)
+        upload_youtube(video_path, titulo, roteiro)
         
         if os.path.exists("narracao.mp3"):
             os.remove("narracao.mp3")
