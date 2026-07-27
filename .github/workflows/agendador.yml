@@ -3,7 +3,7 @@ name: Publicar Shorts Diario
 on:
   workflow_dispatch: # Permite rodar manualmente
   schedule:
-    - cron: '0 12 * * *' # Executa diariamente às 12:00 UTC
+    - cron: '0 18 * * *' # Executa diariamente às 15:00 no horário de Brasília (18:00 UTC)
 
 jobs:
   executar-bot:
