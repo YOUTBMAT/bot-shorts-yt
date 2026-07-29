@@ -31,12 +31,26 @@ jobs:
           sudo sed -i 's/<policy domain="coder" rights="none" pattern="PDF" \/>/<policy domain="coder" rights="read | write" pattern="PDF" \/>/g' /etc/ImageMagick-6/policy.xml || true
           sudo sed -i 's/rights="none" pattern="@\*"/rights="read | write" pattern="@\*"/g' /etc/ImageMagick-6/policy.xml || true
 
-      - name: 5. Instalar bibliotecas Python
+      - name: 5. Cache do modelo de transcricao (faster-whisper)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          # Chave baseada no SO do runner + hash do requirements.txt: muda
+          # automaticamente sempre que uma dependencia (ex: faster-whisper)
+          # for atualizada, sem depender de alguem lembrar de bumpar um "-v1"
+          # manual. Como o tamanho do modelo (WHISPER_MODEL_SIZE) esta fixo
+          # no codigo e nao no requirements.txt, uma troca de modelo por si
+          # so nao invalida o cache automaticamente — nesse caso, o cache
+          # antigo fica orfao (sem problema: o download simplesmente ignora
+          # o cache e baixa o modelo novo por fora dele).
+          key: ${{ runner.os }}-whisper-${{ hashFiles('requirements.txt') }}
+
+      - name: 6. Instalar bibliotecas Python
         run: |
-          python -m pip install --upgrade pip
+          python -m pip install --upgrade pip setuptools wheel
           pip install -r requirements.txt
 
-      - name: 6. Executar o Bot Automatico
+      - name: 7. Executar o Bot Automatico
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}

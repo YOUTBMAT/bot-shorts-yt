@@ -1,221 +1,1415 @@
+"""
+Bot Automático de Publicação de YouTube Shorts.
+
+Pipeline: gera roteiro (Gemini) -> gera narração (ElevenLabs) -> transcreve
+a narração com timestamps por palavra (faster-whisper) -> monta vídeo com
+legendas sincronizadas palavra-a-palavra e legendas dinâmicas (MoviePy) ->
+publica no YouTube.
+
+Este arquivo mantém a mesma arquitetura do projeto original (tudo em um
+único arquivo). A única dependência nova é `faster-whisper`, necessária
+para a sincronização de legendas por palavra — ver justificativa técnica
+na seção de transcrição, mais abaixo.
+"""
+
 import os
+import re
 import json
-import random
 import math
+import time
+import random
+import bisect
+import unicodedata
+import resource
+from dataclasses import dataclass
+from typing import List, Tuple, Optional, Dict
+
+import numpy as np
+from PIL import Image
 from google import genai
 from google.genai import types
 from elevenlabs.client import ElevenLabs
+from faster_whisper import WhisperModel
 from moviepy.editor import (
-    VideoFileClip, 
-    AudioFileClip, 
-    TextClip, 
-    CompositeVideoClip, 
-    CompositeAudioClip
+    VideoFileClip,
+    AudioFileClip,
+    CompositeAudioClip,
+    VideoClip,
+    TextClip,
+    CompositeVideoClip,
+    concatenate_videoclips,
 )
+import moviepy.video.fx.all as vfx
+import moviepy.audio.fx.all as afx
 from googleapiclient.discovery import build
 from google.oauth2.credentials import Credentials
 from googleapiclient.http import MediaFileUpload
 
-# ---------------------------------------------------------------------------
-# 1. GERAR ROTEIRO (Gemini SDK Nova - ~30 Segundos)
-# ---------------------------------------------------------------------------
-def gerar_roteiro():
+
+# ===========================================================================
+# CONFIGURAÇÕES
+# ===========================================================================
+# Todas as constantes do projeto ficam centralizadas aqui. Nenhum "número
+# mágico" deve aparecer solto no restante do código.
+
+# --- Roteiro (Gemini) ---
+MODEL_PRIORITY: List[str] = ["gemini-2.5-flash", "gemini-3.6-flash"]
+MAX_RETRIES: int = 2  # tentativas por modelo antes de passar para o próximo
+ROTEIRO_MIN_PALAVRAS: int = 65
+ROTEIRO_MAX_PALAVRAS: int = 85
+TITULO_MAX_CARACTERES: int = 90
+RETRY_BACKOFF_BASE: float = 1.0  # segundos; dobra a cada nova tentativa (1, 2, 4...)
+RETRY_BACKOFF_JITTER: float = 0.5  # variação aleatória (0 a X segundos) somada à espera
+
+# --- Narração (ElevenLabs) ---
+VOICE_ID: str = "pNInz6obpgDQGcFmaJgB"  # Voz "Adam"
+ELEVEN_MODEL_ID: str = "eleven_multilingual_v2"
+ELEVENLABS_TIMEOUT_SECONDS: float = 120.0  # evita que uma chamada travada prenda o job do GitHub Actions
+NARRACAO_PATH: str = "narracao.mp3"
+
+# --- Vídeo (MoviePy) ---
+VIDEO_FUNDO_PATH: str = "fundo.mp4"
+VIDEO_SAIDA_PATH: str = "video_final.mp4"
+VIDEO_WIDTH: int = 1080
+ASPECT_RATIO: float = 9 / 16  # formato vertical (Shorts)
+
+# --- Legendas sincronizadas por palavra (faster-whisper) ---
+TRANSCRIPTION_ENGINE: str = "faster-whisper"
+WHISPER_MODEL_SIZE: str = "small"  # bom equilíbrio precisão/velocidade em CPU
+WHISPER_COMPUTE_TYPE: str = "int8"  # quantização int8: mais rápido e mais leve em CPU
+WHISPER_LANGUAGE: str = "pt"
+LEGEND_FONT: str = "DejaVu-Sans-Bold"
+LEGEND_FONT_SIZE: int = 58
+NORMAL_COLOR: str = "white"
+ACTIVE_COLOR: str = "yellow"
+STROKE_COLOR: str = "black"
+STROKE_WIDTH: int = 3
+LEGEND_SHADOW_OFFSET: Tuple[int, int] = (3, 4)  # deslocamento (x, y) da sombra em px
+LEGEND_SHADOW_OPACITY: float = 0.45
+LEGEND_WIDTH_FRACTION: float = 0.82  # largura máxima da área de legenda
+LEGEND_WORD_SPACING: int = 18  # espaço horizontal (px) entre palavras
+LEGEND_LINE_SPACING: int = 12  # espaço vertical (px) entre linhas, se o grupo quebrar em 2
+SAFE_AREA_BOTTOM: float = 0.20  # fração da tela reservada na base (fora da legenda)
+POP_SCALE: float = 1.08  # escala máxima do "pop" da palavra ativa (100% -> 108% -> 100%)
+POP_DURATION: float = 0.22  # duração do pop, em segundos, ao ativar uma palavra
+MIN_GROUP_WORDS: int = 3
+MAX_GROUP_WORDS: int = 5
+PAUSA_MINIMA_QUEBRA: float = 0.35  # segundos; pausa que sugere quebra natural de grupo
+
+# --- Edição dinâmica de vídeo (Ken Burns / zoom / pan) ---
+KEN_BURNS_ZOOM_MAX: float = 1.03  # zoom lento e contínuo ao longo do vídeo inteiro
+BLOCK_ZOOM_LEVELS: List[float] = [1.00, 1.05, 1.08, 1.03]  # varia a cada troca de legenda
+PAN_MAX_FRACTION: float = 0.035  # deslocamento horizontal/vertical máx. (fração da tela)
+
+# --- Fade de abertura/fechamento ---
+FADE_TIME: float = 0.4  # segundos (entre 0.3 e 0.5, conforme especificado)
+
+# --- Barra de progresso ---
+BAR_HEIGHT: int = 6  # px (entre 5 e 8, conforme especificado)
+BAR_COLOR: Tuple[int, int, int] = (255, 209, 0)
+BAR_BACKGROUND_COLOR: Tuple[int, int, int] = (35, 35, 35)
+BAR_OPACITY: float = 0.9
+
+# --- Vinheta ---
+VIGNETTE_INTENSITY: float = 0.22  # 0 (nenhuma) a 1 (forte); mantido bem sutil
+
+# --- Renderização ---
+RENDER_PRESET: str = "medium"
+RENDER_BITRATE: str = "8000k"
+RENDER_THREADS: int = 4
+
+# --- Áudio (mixagem: narração + música de fundo) ---
+MUSICA_PATH: str = "musica.mp3"
+MUSIC_VOLUME: float = 0.18  # ganho da música (baixo, para ficar discreta)
+VOICE_VOLUME: float = 1.0  # ganho da narração (deve ficar sempre mais alta)
+MUSIC_FADE_IN: float = 0.8  # segundos (entre 0.5 e 1.0)
+MUSIC_FADE_OUT: float = 0.8  # segundos (entre 0.5 e 1.0)
+MUSIC_LOOP: bool = True  # repete a música automaticamente se ela for mais curta
+ENABLE_SOFT_LIMITER: bool = False  # compressão/saturação (tanh) é opcional; ver nota abaixo
+VOICE_COMPRESSION_DRIVE: float = 1.35  # intensidade da saturação, só usada se ENABLE_SOFT_LIMITER=True
+
+# --- Logs ---
+LARGURA_LOG_TEMPOS: int = 22  # largura usada para alinhar os "...." no resumo de tempos
+
+# --- YouTube ---
+YOUTUBE_CATEGORY_ID: str = "27"  # Educação
+YOUTUBE_TAGS: List[str] = ["shorts", "curiosidades", "fatos interessantes", "ciencia", "viral"]
+YOUTUBE_DESCRICAO_TEMPLATE: str = (
+    "{roteiro}\n\n"
+    "💡 Gostou dessa curiosidade? Inscreva-se no canal para acompanhar mais vídeos diários!\n\n"
+    "#shorts #curiosidades #fatos #ciencia #conhecimento"
+)
+
+# Palavras que nunca devem ficar sozinhas no fim de uma linha de legenda
+# (artigos, preposições e contrações comuns em português) — usadas para
+# decidir onde é seguro quebrar um grupo em duas linhas, quando necessário.
+# As comparações são sempre feitas com o texto já normalizado (sem acento,
+# minúsculo), então não é preciso listar as formas acentuadas aqui.
+PALAVRAS_INSEPARAVEIS = {
+    "o", "a", "os", "as", "um", "uma", "uns", "umas",
+    "do", "da", "dos", "das", "no", "na", "nos", "nas",
+    "ao", "aos", "pelo", "pela", "pelos", "pelas",
+    "num", "numa", "nesse", "nessa", "neste", "nesta",
+    "desse", "dessa", "deste", "desta", "de", "em", "com", "sem",
+}
+
+# Palavras (e categorias) consideradas "importantes" pelo detector de
+# palavras-chave (etapa 8). O detector APENAS marca `is_keyword=True` — ele
+# não aplica nenhum efeito visual; isso fica reservado para uma fase futura.
+PALAVRAS_CHAVE = {
+    "nasa", "lua", "marte", "sol", "terra", "universo",
+    "buraco", "negro", "dna", "oceano",
+    "bilhoes", "bilhao", "milhoes", "milhao",
+    "gigante", "minusculo", "maior", "menor",
+    "primeiro", "primeira", "ultimo", "ultima",
+    "recorde", "ano", "anos",
+}
+
+
+# ===========================================================================
+# 1. GERAR ROTEIRO (Gemini SDK)
+# ===========================================================================
+def _montar_prompt_roteiro() -> str:
+    """Monta o prompt que instrui o Gemini a atuar como roteirista viral."""
+    return f"""
+Você é um roteirista profissional especializado em vídeos virais para YouTube
+Shorts. Seu único objetivo é prender a atenção do espectador do primeiro ao
+último segundo.
+
+Gere UMA curiosidade fascinante e verdadeira sobre um dos temas abaixo,
+alternando bastante entre eles e evitando assuntos já muito repetidos:
+espaço, história, natureza, ciência, animais, corpo humano, oceanos ou
+tecnologia.
+
+Estruture o roteiro mentalmente seguindo este ritmo (não escreva os tempos,
+apenas siga a lógica):
+- 0 a 3 segundos: um gancho extremamente forte, que gere impacto imediato.
+- 3 a 10 segundos: construa curiosidade, sem entregar a resposta ainda.
+- 10 a 22 segundos: entregue a revelação de forma clara e surpreendente.
+- 22 a 30 segundos: encerre com uma frase de impacto, sem pedir inscrição.
+
+REGRAS OBRIGATÓRIAS:
+1. Nunca cumprimente, nunca diga "olá" e nunca escreva introduções.
+2. Nunca peça para se inscrever ou curtir dentro do roteiro.
+3. Utilize apenas fatos amplamente aceitos e verificáveis. Nunca invente dados.
+4. Use frases curtas, linguagem natural e fluida, como se estivesse contando
+   algo incrível para um amigo.
+5. O roteiro deve ter entre {ROTEIRO_MIN_PALAVRAS} e {ROTEIRO_MAX_PALAVRAS}
+   palavras.
+6. O título deve despertar curiosidade imediata, no estilo de:
+   "A NASA descobriu isso por acidente", "Ninguém consegue explicar isso",
+   "Esse animal desafia a ciência", "Isso realmente aconteceu".
+   Evite títulos genéricos. Máximo de {TITULO_MAX_CARACTERES} caracteres.
+7. Responda ESTRITAMENTE em JSON válido, sem nenhum texto fora do JSON, com
+   as chaves "titulo" e "roteiro".
+
+Exemplo de formato (não copie o conteúdo, apenas o formato):
+{{"titulo": "O mistério do espaço em silêncio", "roteiro": "Você sabia que o espaço é totalmente silencioso? Como não existe ar para transportar ondas sonoras, mesmo as explosões mais gigantescas do universo acontecem em silêncio absoluto. Se você estivesse no meio de uma supernova, não ouviria nada! O som precisa de um meio físico, como o ar ou a água, para se propagar."}}
+""".strip()
+
+
+def _extrair_json(texto: str) -> Optional[dict]:
+    """Tenta interpretar `texto` como JSON, mesmo com texto extra ao redor.
+
+    Primeiro tenta um parse direto (caso comum: resposta é só o JSON). Se
+    falhar, varre a string procurando cada ocorrência de '{' e tenta um
+    `raw_decode` a partir dali — isso recupera o JSON corretamente mesmo
+    quando o modelo escreve texto antes e/ou depois dele, sem depender de
+    uma regex gulosa que poderia capturar chaves de trechos não relacionados.
+    """
+    texto = texto.strip()
+    try:
+        return json.loads(texto)
+    except json.JSONDecodeError:
+        pass
+
+    decodificador = json.JSONDecoder()
+    for indice, caractere in enumerate(texto):
+        if caractere != "{":
+            continue
+        try:
+            dados, _ = decodificador.raw_decode(texto, indice)
+            return dados
+        except json.JSONDecodeError:
+            continue  # essa ocorrência de '{' não inicia um JSON válido
+
+    return None
+
+
+def _validar_roteiro(dados: dict) -> Tuple[str, str]:
+    """Valida e normaliza o dicionário retornado pelo Gemini."""
+    if "titulo" not in dados or "roteiro" not in dados:
+        raise ValueError("JSON não contém as chaves 'titulo' e 'roteiro'.")
+
+    titulo = str(dados["titulo"]).strip()
+    roteiro = str(dados["roteiro"]).strip()
+
+    if not titulo or not roteiro:
+        raise ValueError("Título ou roteiro vazio.")
+
+    if len(titulo) > TITULO_MAX_CARACTERES:
+        titulo = titulo[: TITULO_MAX_CARACTERES - 1].rstrip() + "…"
+
+    num_palavras = len(roteiro.split())
+    if not (ROTEIRO_MIN_PALAVRAS - 15 <= num_palavras <= ROTEIRO_MAX_PALAVRAS + 15):
+        # Fora de uma margem razoável: provavelmente o modelo ignorou a regra.
+        raise ValueError(f"Roteiro fora do tamanho esperado ({num_palavras} palavras).")
+
+    return titulo, roteiro
+
+
+def gerar_roteiro() -> Tuple[str, str]:
+    """Gera um roteiro inédito usando o Gemini, com fallback entre modelos."""
     print("🧠 [1/4] Gerando roteiro inédito com o Gemini...")
     api_key = os.environ.get("GEMINI_API_KEY")
     client = genai.Client(api_key=api_key)
+    prompt = _montar_prompt_roteiro()
 
-    prompt = """
-    Gere UMA curiosidade fascinante, detalhada e impressionante sobre ciência, espaço, história ou natureza para um vídeo curto do YouTube Shorts.
-    
-    REGRAS OBRIGATÓRIAS:
-    1. Texto direto, sem saudações ou "bem-vindos".
-    2. O roteiro deve ter entre 65 e 85 palavras para garantir um vídeo de ~30 segundos.
-    3. Comece com um gancho muito forte ("Você sabia que...", "Existe um fenômeno inacreditável...").
-    4. Responda ESTRITAMENTE em formato JSON válido com as chaves "titulo" e "roteiro".
+    ultimo_erro: Optional[Exception] = None
 
-    Exemplo:
-    {"titulo": "O mistério do espaço em silêncio #shorts", "roteiro": "Você sabia que o espaço é totalmente silencioso? Como não existe ar para transportar as ondas sonoras, mesmo as explosões mais gigantescas no universo acontecem em absoluto silêncio. Se você estivesse no meio de uma super nova, não ouviria absolutamente nada! Isso acontece porque o som precisa de um meio físico como o ar ou a água para se propagar."}
-    """
+    # Sequência plana de tentativas (modelo, número da tentativa naquele
+    # modelo), usada tanto para os logs quanto para o cálculo do backoff.
+    tentativas = [
+        (modelo, tentativa)
+        for modelo in MODEL_PRIORITY
+        for tentativa in range(1, MAX_RETRIES + 1)
+    ]
 
-    modelos = ['gemini-2.5-flash', 'gemini-3.6-flash']
-    
-    resposta = None
-    for mod in modelos:
+    for indice, (modelo, tentativa) in enumerate(tentativas, start=1):
         try:
-            print(f"🔄 Tentando gerar com o modelo: {mod}...")
+            print(f"🔄 Tentando gerar com '{modelo}' (tentativa {tentativa}/{MAX_RETRIES})...")
             resposta = client.models.generate_content(
-                model=mod,
+                model=modelo,
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json"
-                )
+                ),
             )
-            print(f"✅ Sucesso utilizando {mod}!")
-            break
+
+            if not resposta or not resposta.text:
+                raise ValueError("Resposta vazia do modelo.")
+
+            dados = _extrair_json(resposta.text)
+            if dados is None:
+                raise ValueError("Não foi possível interpretar o JSON retornado.")
+
+            titulo, roteiro = _validar_roteiro(dados)
+            print(f"✅ Sucesso utilizando '{modelo}'!")
+            return titulo, roteiro
+
         except Exception as err:
-            print(f"⚠️ Erro ao usar {mod}: {err}")
-            continue
+            ultimo_erro = err
+            print(f"⚠️ Falha com '{modelo}' (tentativa {tentativa}/{MAX_RETRIES}): {err}")
 
-    if not resposta or not resposta.text:
-        raise Exception("Não foi possível gerar o roteiro com nenhum dos modelos disponíveis.")
+            if indice < len(tentativas):
+                espera = RETRY_BACKOFF_BASE * (2 ** (indice - 1))
+                espera += random.uniform(0, RETRY_BACKOFF_JITTER)
+                print(f"⏳ Tentativa {indice + 1} em {espera:.1f} segundos...")
+                time.sleep(espera)
 
-    dados = json.loads(resposta.text.strip())
-    return dados["titulo"], dados["roteiro"]
+    raise Exception(
+        f"Não foi possível gerar o roteiro com nenhum dos modelos disponíveis. Último erro: {ultimo_erro}"
+    )
 
-# ---------------------------------------------------------------------------
+
+# ===========================================================================
 # 2. GERAR ÁUDIO (ElevenLabs)
-# ---------------------------------------------------------------------------
-def gerar_audio(texto, caminho_saida="narracao.mp3"):
-    print("🎙️ [2/4] Gerando voz ultra-realista com a ElevenLabs...")
-    client = ElevenLabs(api_key=os.environ.get("ELEVENLABS_API_KEY"))
-    
-    audio_stream = client.text_to_speech.convert(
-        voice_id="pNInz6obpgDQGcFmaJgB", # Voz Adam
-        text=texto,
-        model_id="eleven_multilingual_v2"
-    )
-    
-    with open(caminho_saida, "wb") as f:
-        for chunk in audio_stream:
-            if chunk:
-                f.write(chunk)
-    return caminho_saida
+# ===========================================================================
+def preparar_texto_para_narracao(texto: str) -> str:
+    """Ajusta o texto para soar mais natural quando narrado.
 
-# ---------------------------------------------------------------------------
-# 3. EDITAR VÍDEO (MoviePy + Legendas Dinâmicas)
-# ---------------------------------------------------------------------------
-def criar_video(roteiro_completo, caminho_audio, caminho_video_fundo, caminho_saida="video_final.mp4"):
-    print(f"🎬 [3/4] Montando vídeo final com legendas dinâmicas e design pro...")
-    
-    FONT_NAME = "DejaVu-Sans-Bold"
-    FONT_SIZE = 65
-    COLOR_TEXT = "yellow"
-    STROKE_COLOR = "black"
-    STROKE_WIDTH = 2
-    
-    clip_video = VideoFileClip(caminho_video_fundo)
-    clip_audio = AudioFileClip(caminho_audio)
-    
-    final_duration = clip_audio.duration
-    
-    # Loop do vídeo de fundo se o áudio for mais longo que o vídeo original
-    if clip_video.duration < final_duration:
-        num_loops = math.ceil(final_duration / clip_video.duration)
-        clips = [clip_video] * num_loops
-        from moviepy.editor import concatenate_videoclips
-        clip_video = concatenate_videoclips(clips)
-        
-    clip_video = clip_video.subclip(0, final_duration)
-    
-    # Redimensionamento e Crop 9:16
-    w, h = clip_video.size
-    target_ratio = 9/16
-    
-    if w/h > target_ratio:
-        new_w = h * target_ratio
-        clip_video = clip_video.crop(x1=(w-new_w)/2, y1=0, width=new_w, height=h)
-    else:
-        new_h = w / target_ratio
-        clip_video = clip_video.crop(x1=0, y1=(h-new_h)/2, width=w, height=new_h)
-        
-    clip_video = clip_video.resize(width=1080)
-    final_w, final_h = clip_video.size
+    Normaliza espaços, garante pontuação final e insere pequenas pausas
+    (vírgulas) em conectores comuns, sem alterar o significado do texto e
+    sem abusar de reticências.
+    """
+    texto = re.sub(r"\s+", " ", texto).strip()
 
-    # Legendas em blocos de 5 palavras
-    palavras = roteiro_completo.split()
-    tamanho_bloco = 5
-    blocos_texto = []
-    for i in range(0, len(palavras), tamanho_bloco):
-        bloco = " ".join(palavras[i : i + tamanho_bloco])
-        blocos_texto.append(bloco)
+    # Garante espaçamento correto após pontuação.
+    texto = re.sub(r"\s+([.,!?;:])", r"\1", texto)
+    texto = re.sub(r"([.,!?;:])(?=\S)", r"\1 ", texto)
 
-    num_blocos = len(blocos_texto)
-    duration_per_block = final_duration / num_blocos
-    
-    text_clips = []
-    
-    for i, texto in enumerate(blocos_texto):
-        start_time = i * duration_per_block
-        
-        txt_clip = TextClip(
+    # Insere uma pequena pausa natural antes de conectores de contraste,
+    # quando ainda não houver pontuação ali.
+    conectores = ["mas", "porém", "então", "porque", "e por isso"]
+    for conector in conectores:
+        texto = re.sub(
+            rf"(?<![,.!?])\s+({conector})\b",
+            r", \1",
             texto,
-            fontsize=FONT_SIZE,
-            font=FONT_NAME,
-            color=COLOR_TEXT,
-            stroke_color=STROKE_COLOR,
-            stroke_width=STROKE_WIDTH,
-            method='caption',
-            size=(final_w * 0.8, None),
-            align='center',
-            interline=10
+            flags=re.IGNORECASE,
         )
-        
-        txt_clip = txt_clip.set_start(start_time).set_duration(duration_per_block)
-        txt_clip = txt_clip.set_position(('center', 0.55), relative=True)
-        txt_clip = txt_clip.crossfadein(0.15).crossfadeout(0.15)
-        
-        text_clips.append(txt_clip)
 
-    video_final = CompositeVideoClip([clip_video] + text_clips)
-    video_final = video_final.set_audio(clip_audio)
-    
-    print("⏳ Renderizando vídeo...")
-    video_final.write_videofile(
-        caminho_saida,
-        codec="libx264",
-        audio_codec="aac",
-        threads=4,
-        logger=None
-    )
-    
+    # Evita sequências de pontuação redundante (ex: ",,", ". ,").
+    texto = re.sub(r"[,]{2,}", ",", texto)
+    texto = re.sub(r"\.{4,}", "...", texto)  # nunca mais que reticências padrão
+
+    if not texto.endswith((".", "!", "?")):
+        texto += "."
+
+    return texto.strip()
+
+
+def gerar_audio(texto: str, caminho_saida: str = NARRACAO_PATH) -> str:
+    """Gera o arquivo de narração em áudio a partir do roteiro."""
+    print("🎙️ [2/4] Gerando voz ultra-realista com a ElevenLabs...")
+    texto_narracao = preparar_texto_para_narracao(texto)
+
+    client = ElevenLabs(api_key=os.environ.get("ELEVENLABS_API_KEY"), timeout=ELEVENLABS_TIMEOUT_SECONDS)
+
+    try:
+        audio_stream = client.text_to_speech.convert(
+            voice_id=VOICE_ID,
+            text=texto_narracao,
+            model_id=ELEVEN_MODEL_ID,
+        )
+
+        bytes_escritos = 0
+        with open(caminho_saida, "wb") as arquivo:
+            for chunk in audio_stream:
+                if chunk:
+                    arquivo.write(chunk)
+                    bytes_escritos += len(chunk)
+
+    except Exception as err:
+        # Cobre tanto erro de rede/timeout (a lib já usa um timeout padrão de
+        # ELEVENLABS_TIMEOUT_SECONDS, então "demora demais" também cai aqui)
+        # quanto qualquer outra falha da API.
+        raise RuntimeError(f"❌ ElevenLabs: falha ao gerar a narração ({err}).") from err
+
+    if bytes_escritos == 0:
+        # A API "funcionou" (não lançou erro) mas devolveu um áudio vazio.
+        raise RuntimeError("❌ ElevenLabs: a narração gerada está vazia (0 bytes).")
+
     return caminho_saida
 
-# ---------------------------------------------------------------------------
-# 4. UPLOAD YOUTUBE (Descrição Otimizada)
-# ---------------------------------------------------------------------------
-def upload_youtube(caminho_video, titulo, roteiro):
-    print("🚀 [4/4] Enviando o vídeo para o YouTube Shorts...")
-    token_json_str = os.environ.get("YOUTUBE_TOKEN_JSON")
-    info_token = json.loads(token_json_str)
-    
-    credentials = Credentials.from_authorized_user_info(info_token)
-    youtube = build('youtube', 'v3', credentials=credentials)
 
-    descricao = f"{roteiro}\n\n💡 Gostou dessa curiosidade? Inscreva-se no canal para acompanhar mais vídeos diários!\n\n#shorts #curiosidades #fatos #ciencia #conhecimento"
+# ===========================================================================
+# 2.1 TRANSCRIÇÃO E SINCRONIZAÇÃO DE PALAVRAS (faster-whisper)
+# ===========================================================================
+# Escolha de tecnologia: faster-whisper (CTranslate2) em vez do Whisper
+# "original" (openai-whisper) ou do whisper.cpp.
+#
+#   • openai-whisper: mesma qualidade de transcrição, mas roda vários
+#     múltiplos mais devagar em CPU (não tem backend otimizado) — arriscado
+#     para o tempo de execução no GitHub Actions.
+#   • whisper.cpp: rápido em CPU, mas exigiria compilar um binário C++
+#     dentro do workflow (passo extra, mais superfície de manutenção/erro
+#     de build) e um wrapper Python separado para extrair os timestamps.
+#   • faster-whisper: usa o backend CTranslate2, é sensivelmente mais rápido
+#     que o Whisper original em CPU, suporta quantização int8 (menos RAM),
+#     já devolve timestamps por palavra nativamente (`word_timestamps=True`)
+#     e se instala com um `pip install` normal — sem compilar nada.
+#
+# Por isso, para "compatibilidade com GitHub Actions + baixo consumo de
+# memória + velocidade em CPU + facilidade de manutenção", faster-whisper é
+# a opção com melhor equilíbrio para este cenário.
 
-    body = {
-        'snippet': {
-            'title': titulo,
-            'description': descricao,
-            'tags': ['shorts', 'curiosidades', 'fatos interessantes', 'ciencia', 'viral'],
-            'categoryId': '27'
-        },
-        'status': {
-            'privacyStatus': 'public',
-            'selfDeclaredMadeForKids': False
-        }
-    }
+@dataclass
+class PalavraLegenda:
+    """Estrutura interna de cada palavra transcrita, usada em toda a
+    renderização das legendas (agrupamento, cache, animação)."""
+    palavra: str
+    start: float
+    end: float
+    duration: float
+    index: int
+    is_keyword: bool = False
+    future_effect: Optional[str] = None  # reservado para uso futuro; não usado ainda
 
-    media = MediaFileUpload(caminho_video, chunksize=-1, resumable=True)
-    request = youtube.videos().insert(part=','.join(body.keys()), body=body, media_body=media)
-    resposta = request.execute()
-    print(f"✅ Sucesso! Vídeo publicado com o ID: {resposta['id']}")
 
-# ---------------------------------------------------------------------------
-# EXECUÇÃO PRINCIPAL
-# ---------------------------------------------------------------------------
-if __name__ == "__main__":
+def _normalizar_palavra(palavra: str) -> str:
+    """Remove acentos e pontuação, deixando minúsculo — usado só para
+    comparações internas (palavra-chave, palavras inseparáveis)."""
+    sem_acento = unicodedata.normalize("NFKD", palavra).encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"[^a-z0-9]", "", sem_acento.lower())
+
+
+_REGEX_NUMERO = re.compile(r"^\d+([.,]\d+)?%?$")
+_REGEX_ANO = re.compile(r"^(1[6-9]|20)\d{2}$")
+
+
+def _eh_palavra_chave(palavra: str) -> bool:
+    """Detector de palavras importantes (etapa 8): apenas marca, não aplica
+    nenhum efeito visual — isso fica para uma fase futura."""
+    normalizada = _normalizar_palavra(palavra)
+    if normalizada in PALAVRAS_CHAVE:
+        return True
+
+    apenas_numero = re.sub(r"[^\d.,%]", "", palavra)
+    if apenas_numero and (_REGEX_NUMERO.match(apenas_numero) or _REGEX_ANO.match(apenas_numero)):
+        return True
+
+    return False
+
+
+def transcrever_narracao(caminho_audio: str) -> List[PalavraLegenda]:
+    """Transcreve a narração com faster-whisper e devolve timestamps por
+    palavra. Roda sobre a narração original (limpa), antes da mixagem com
+    música, para não prejudicar a precisão da transcrição.
+    """
+    print(f"📝 Iniciando transcrição ({TRANSCRIPTION_ENGINE}, modelo '{WHISPER_MODEL_SIZE}')...")
+    inicio = time.perf_counter()
+
     try:
-        titulo, roteiro = gerar_roteiro()
-        audio_path = gerar_audio(roteiro)
-        video_fundo = "fundo.mp4" 
-        
-        video_path = criar_video(roteiro, audio_path, video_fundo)
-        upload_youtube(video_path, titulo, roteiro)
-        
-        if os.path.exists("narracao.mp3"):
-            os.remove("narracao.mp3")
-            
-    except Exception as e:
-        print(f"❌ Ocorreu um erro na execução: {e}")
-        exit(1)
+        modelo = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type=WHISPER_COMPUTE_TYPE)
+        segmentos, _info = modelo.transcribe(
+            caminho_audio,
+            language=WHISPER_LANGUAGE,
+            word_timestamps=True,
+            vad_filter=True,
+        )
+    except Exception as err:
+        # Cobre tanto falha ao carregar/baixar os pesos do modelo quanto
+        # falha ao decodificar um áudio inválido.
+        raise RuntimeError(f"❌ Whisper: falha na transcrição ({err}).") from err
+
+    palavras: List[PalavraLegenda] = []
+    try:
+        for segmento in segmentos:
+            for palavra_w in (segmento.words or []):
+                texto = palavra_w.word.strip()
+                if not texto:
+                    continue
+
+                inicio_p, fim_p = float(palavra_w.start), float(palavra_w.end)
+                if fim_p <= inicio_p:
+                    fim_p = inicio_p + 0.05  # segurança contra timestamps degenerados
+
+                palavras.append(PalavraLegenda(
+                    palavra=texto,
+                    start=inicio_p,
+                    end=fim_p,
+                    duration=fim_p - inicio_p,
+                    index=len(palavras),
+                    is_keyword=_eh_palavra_chave(texto),
+                ))
+    except Exception as err:
+        raise RuntimeError(f"❌ Whisper: falha ao processar os segmentos transcritos ({err}).") from err
+
+    if not palavras:
+        raise ValueError("A transcrição não retornou nenhuma palavra — verifique o áudio gerado.")
+
+    print(f"🎤 Transcrição concluída em {time.perf_counter() - inicio:.2f}s")
+    print(f"📚 {len(palavras)} palavras")
+    return palavras
+
+
+FINAIS_DE_FRASE = {".", "!", "?", "…"}
+
+
+def agrupar_palavras_em_blocos(palavras: List[PalavraLegenda]) -> List[List[PalavraLegenda]]:
+    """Agrupa as palavras em blocos de MIN_GROUP_WORDS a MAX_GROUP_WORDS,
+    fechando o grupo preferencialmente em fim de frase ou pausa natural —
+    nunca no meio de uma ideia, quando é possível evitar.
+    """
+    grupos: List[List[PalavraLegenda]] = []
+    atual: List[PalavraLegenda] = []
+
+    for i, palavra in enumerate(palavras):
+        atual.append(palavra)
+
+        ultima_letra = palavra.palavra.rstrip()[-1:]
+        fim_de_frase = ultima_letra in FINAIS_DE_FRASE
+        proxima = palavras[i + 1] if i + 1 < len(palavras) else None
+        pausa = (proxima.start - palavra.end) if proxima else None
+        pausa_longa = pausa is not None and pausa >= PAUSA_MINIMA_QUEBRA
+
+        atingiu_maximo = len(atual) >= MAX_GROUP_WORDS
+        pode_fechar = len(atual) >= MIN_GROUP_WORDS
+        eh_ultima_palavra = proxima is None
+
+        deve_fechar = atingiu_maximo or eh_ultima_palavra or (pode_fechar and (fim_de_frase or pausa_longa))
+
+        if deve_fechar:
+            grupos.append(atual)
+            atual = []
+
+    if atual:
+        # Sobra de palavras menor que o mínimo (fim do roteiro): funde no
+        # grupo anterior se couber, em vez de deixar um grupo órfão.
+        if grupos and len(grupos[-1]) + len(atual) <= MAX_GROUP_WORDS:
+            grupos[-1].extend(atual)
+        else:
+            grupos.append(atual)
+
+    print(f"🎬 {len(grupos)} grupos")
+    return grupos
+
+
+# ===========================================================================
+# 3. EDITAR VÍDEO (MoviePy + Legendas Dinâmicas)
+# ===========================================================================
+
+
+def _escolher_posicao_de_corte(sobra: float) -> float:
+    """Escolhe um deslocamento de corte agradável em vez de sempre centralizar.
+
+    Recebe o espaço "sobrando" (em pixels) para cortar de um lado e escolhe um
+    ponto de corte levemente fora do centro, evitando que o resultado pareça
+    sempre a mesma composição.
+    """
+    if sobra <= 0:
+        return 0.0
+    # Desloca até ~35% da folga disponível para um dos lados, nunca cortando
+    # de forma extrema. O sinal (esquerda/direita ou cima/baixo) é aleatório.
+    deslocamento_max = sobra * 0.35
+    return random.uniform(-deslocamento_max, deslocamento_max)
+
+
+def _redimensionar_para_vertical(clip: VideoFileClip) -> VideoFileClip:
+    """Corta o vídeo de fundo para o formato vertical 9:16 com crop inteligente.
+
+    Em vez de sempre cortar exatamente no centro, escolhe um ponto de corte
+    levemente deslocado quando há folga suficiente, resultando em uma
+    composição um pouco mais agradável e menos repetitiva entre execuções.
+    """
+    w, h = clip.size
+
+    if w / h > ASPECT_RATIO:
+        nova_largura = h * ASPECT_RATIO
+        sobra = w - nova_largura
+        x1 = (w - nova_largura) / 2 + _escolher_posicao_de_corte(sobra)
+        x1 = max(0, min(x1, w - nova_largura))
+        clip = clip.crop(x1=x1, y1=0, width=nova_largura, height=h)
+    else:
+        nova_altura = w / ASPECT_RATIO
+        sobra = h - nova_altura
+        y1 = (h - nova_altura) / 2 + _escolher_posicao_de_corte(sobra)
+        y1 = max(0, min(y1, h - nova_altura))
+        clip = clip.crop(x1=0, y1=y1, width=w, height=nova_altura)
+
+    return clip.resize(width=VIDEO_WIDTH)
+
+
+def _sequencia_zoom_por_bloco(quantidade_blocos: int) -> List[float]:
+    """Gera uma sequência de níveis de zoom que nunca repete o valor anterior."""
+    sequencia: List[float] = []
+    anterior: Optional[float] = None
+
+    for _ in range(quantidade_blocos):
+        candidatos = [z for z in BLOCK_ZOOM_LEVELS if z != anterior]
+        escolha = random.choice(candidatos)
+        sequencia.append(escolha)
+        anterior = escolha
+
+    return sequencia
+
+
+def _aplicar_ken_burns(
+    clip: VideoFileClip,
+    duracao_total: float,
+    pontos_de_corte: List[float],
+) -> CompositeVideoClip:
+    """Aplica um efeito Ken Burns sutil: zoom lento contínuo + zoom por segmento.
+
+    O vídeo nunca fica completamente parado: combina um zoom lento e
+    constante ao longo de todo o vídeo com uma leve variação de zoom a cada
+    troca de legenda (usando os tempos reais de início de cada grupo,
+    vindos da transcrição), além de um pan (movimento horizontal e
+    vertical) muito discreto. O deslocamento é sempre limitado (clampado) à
+    margem real disponível na imagem ampliada, então nunca aparecem bordas
+    pretas.
+    """
+    canvas_w, canvas_h = clip.size
+
+    limites = sorted(set([0.0, duracao_total] + [t for t in pontos_de_corte if 0 < t < duracao_total]))
+    quantidade_segmentos = max(1, len(limites) - 1)
+    sequencia_zoom = _sequencia_zoom_por_bloco(quantidade_segmentos)
+
+    def indice_do_segmento(t: float) -> int:
+        idx = bisect.bisect_right(limites, t) - 1
+        return min(max(idx, 0), quantidade_segmentos - 1)
+
+    direcao_x = random.choice([-1, 1])
+    direcao_y = random.choice([-1, 1])
+
+    # Mesmo padrão de cache usado nas legendas: `escala(t)` normalmente
+    # seria chamada duas vezes por frame (uma pelo `resize`, outra pela
+    # `posicao`, ambas para o mesmo `t`). O ganho aqui é bem menor do que
+    # nas legendas (é só um `bisect` + algumas contas), mas ainda é uma
+    # duplicação real, então corrigimos pelo mesmo motivo.
+    _ultima_escala = {"t": None, "valor": None}
+
+    def escala(t: float) -> float:
+        if _ultima_escala["t"] != t:
+            zoom_bloco = sequencia_zoom[indice_do_segmento(t)]
+            progresso_geral = min(t / duracao_total, 1.0) if duracao_total > 0 else 0.0
+            zoom_lento = 1.0 + (KEN_BURNS_ZOOM_MAX - 1.0) * progresso_geral
+            # Soma aditiva (em vez de multiplicativa) para manter o zoom
+            # total sempre dentro de uma faixa previsível e sutil.
+            _ultima_escala["t"] = t
+            _ultima_escala["valor"] = 1.0 + (zoom_bloco - 1.0) + (zoom_lento - 1.0)
+        return _ultima_escala["valor"]
+
+    clip_com_zoom = clip.resize(escala)
+
+    def posicao(t: float) -> Tuple[float, float]:
+        fator = escala(t)
+        largura_atual = canvas_w * fator
+        altura_atual = canvas_h * fator
+
+        margem_x = max((largura_atual - canvas_w) / 2, 0.0)
+        margem_y = max((altura_atual - canvas_h) / 2, 0.0)
+
+        progresso_pan = (min(t / duracao_total, 1.0) - 0.5) * 2 if duracao_total > 0 else 0.0
+        offset_x = direcao_x * PAN_MAX_FRACTION * canvas_w * progresso_pan
+        offset_y = direcao_y * PAN_MAX_FRACTION * canvas_h * progresso_pan
+
+        # Nunca deixa o deslocamento revelar bordas: limita à margem real.
+        offset_x = max(-margem_x, min(margem_x, offset_x))
+        offset_y = max(-margem_y, min(margem_y, offset_y))
+
+        x = (canvas_w - largura_atual) / 2 + offset_x
+        y = (canvas_h - altura_atual) / 2 + offset_y
+        return (x, y)
+
+    clip_com_zoom = clip_com_zoom.set_position(posicao)
+
+    return CompositeVideoClip([clip_com_zoom], size=(canvas_w, canvas_h)).set_duration(duracao_total)
+
+
+def _aplicar_vinheta(clip: CompositeVideoClip, intensidade: float = VIGNETTE_INTENSITY) -> CompositeVideoClip:
+    """Aplica uma vinheta discreta (escurecimento sutil nos cantos)."""
+    if intensidade <= 0:
+        return clip
+
+    largura, altura = clip.size
+    y, x = np.ogrid[:altura, :largura]
+    centro_x, centro_y = largura / 2, altura / 2
+    distancia_max = math.hypot(centro_x, centro_y)
+
+    distancia_normalizada = np.hypot(x - centro_x, y - centro_y) / distancia_max
+    mascara = 1.0 - intensidade * (distancia_normalizada ** 2)
+    mascara = np.clip(mascara, 1.0 - intensidade, 1.0)
+    mascara = mascara[..., np.newaxis]  # broadcast para os 3 canais RGB
+
+    def aplicar_mascara(frame: np.ndarray) -> np.ndarray:
+        return np.clip(frame.astype(np.float32) * mascara, 0, 255).astype("uint8")
+
+    return clip.fl_image(aplicar_mascara)
+
+
+def _criar_barra_progresso(largura: int, duracao: float) -> VideoClip:
+    """Cria uma barra de progresso fina e elegante no topo do vídeo."""
+
+    def make_frame(t: float) -> np.ndarray:
+        frame = np.empty((BAR_HEIGHT, largura, 3), dtype=np.uint8)
+        frame[:, :] = BAR_BACKGROUND_COLOR
+        progresso_px = int(largura * min(t / duracao, 1.0)) if duracao > 0 else 0
+        frame[:, :progresso_px] = BAR_COLOR
+        return frame
+
+    barra = VideoClip(make_frame=make_frame, duration=duracao)
+    barra = barra.set_position((0, 0)).set_opacity(BAR_OPACITY)
+    return barra
+
+
+# ---------------------------------------------------------------------------
+# 3.1 CACHE E RENDERIZAÇÃO DE PALAVRAS (etapas 5, 6 e 9)
+# ---------------------------------------------------------------------------
+# Cada combinação única de (texto da palavra, estilo) é renderizada via
+# ImageMagick/TextClip APENAS UMA VEZ por execução do bot e fica guardada
+# aqui. Como palavras curtas ("que", "de", "não"...) se repetem muito em
+# português, isso reduz bastante o número de chamadas ao ImageMagick — que é
+# o gargalo mais caro de todo o sistema de legendas.
+_CACHE_PALAVRAS_RENDERIZADAS: Dict[Tuple[str, str], Tuple[np.ndarray, np.ndarray]] = {}
+_estatisticas_cache = {"acertos": 0, "faltas": 0}
+
+
+def _resetar_cache_legendas() -> None:
+    """Limpa o cache de tiles de palavras (chamado uma vez por vídeo)."""
+    _CACHE_PALAVRAS_RENDERIZADAS.clear()
+    _estatisticas_cache["acertos"] = 0
+    _estatisticas_cache["faltas"] = 0
+
+
+def _obter_frame_e_alpha(clip: TextClip) -> Tuple[np.ndarray, np.ndarray]:
+    """Extrai o frame RGB e o canal alpha (transparência) de um TextClip."""
+    frame = clip.get_frame(0)
+    if clip.mask is not None:
+        alpha = clip.mask.get_frame(0).astype(np.float32)
+    else:
+        alpha = np.ones(frame.shape[:2], dtype=np.float32)
+    return frame, alpha
+
+
+def _colar_tile(
+    canvas_rgb: np.ndarray,
+    canvas_alpha: np.ndarray,
+    tile_rgb: np.ndarray,
+    tile_alpha: np.ndarray,
+    x: int,
+    y: int,
+) -> None:
+    """Cola (com alpha blending) um tile de imagem sobre um canvas, in-place."""
+    altura_canvas, largura_canvas = canvas_alpha.shape
+    h, w = tile_alpha.shape
+    x0, y0 = max(x, 0), max(y, 0)
+    x1, y1 = min(x + w, largura_canvas), min(y + h, altura_canvas)
+    if x1 <= x0 or y1 <= y0:
+        return  # tile cai inteiramente fora do canvas
+
+    tx0, ty0 = x0 - x, y0 - y
+    tx1, ty1 = tx0 + (x1 - x0), ty0 + (y1 - y0)
+
+    alpha_fatia = tile_alpha[ty0:ty1, tx0:tx1][..., np.newaxis]
+    canvas_rgb[y0:y1, x0:x1] = (
+        tile_rgb[ty0:ty1, tx0:tx1] * alpha_fatia + canvas_rgb[y0:y1, x0:x1] * (1 - alpha_fatia)
+    ).astype(np.uint8)
+    canvas_alpha[y0:y1, x0:x1] = np.maximum(
+        canvas_alpha[y0:y1, x0:x1], tile_alpha[ty0:ty1, tx0:tx1]
+    )
+
+
+def _obter_tile_palavra(texto: str, estilo: str) -> Tuple[np.ndarray, np.ndarray]:
+    """Renderiza (ou reaproveita do cache) o tile pronto de uma palavra.
+
+    `estilo` é "normal" (branca) ou "ativa" (amarela, com contorno preto e
+    sombra discreta) — os dois únicos estilos definidos na etapa 5.
+    """
+    chave = (texto, estilo)
+    tile_em_cache = _CACHE_PALAVRAS_RENDERIZADAS.get(chave)
+    if tile_em_cache is not None:
+        _estatisticas_cache["acertos"] += 1
+        return tile_em_cache
+
+    _estatisticas_cache["faltas"] += 1
+
+    try:
+        if estilo == "ativa":
+            clip_texto = TextClip(
+                texto, fontsize=LEGEND_FONT_SIZE, font=LEGEND_FONT, color=ACTIVE_COLOR,
+                stroke_color=STROKE_COLOR, stroke_width=STROKE_WIDTH, method="label",
+            )
+            clip_sombra = TextClip(
+                texto, fontsize=LEGEND_FONT_SIZE, font=LEGEND_FONT, color="black", method="label",
+            ).set_opacity(LEGEND_SHADOW_OPACITY)
+
+            largura = max(clip_texto.w, clip_sombra.w + LEGEND_SHADOW_OFFSET[0])
+            altura = max(clip_texto.h, clip_sombra.h + LEGEND_SHADOW_OFFSET[1])
+            canvas_rgb = np.zeros((altura, largura, 3), dtype=np.uint8)
+            canvas_alpha = np.zeros((altura, largura), dtype=np.float32)
+
+            sombra_rgb, sombra_alpha = _obter_frame_e_alpha(clip_sombra)
+            _colar_tile(canvas_rgb, canvas_alpha, sombra_rgb, sombra_alpha, *LEGEND_SHADOW_OFFSET)
+
+            texto_rgb, texto_alpha = _obter_frame_e_alpha(clip_texto)
+            _colar_tile(canvas_rgb, canvas_alpha, texto_rgb, texto_alpha, 0, 0)
+
+            clip_texto.close()
+            clip_sombra.close()
+            resultado = (canvas_rgb, canvas_alpha)
+        else:
+            clip_texto = TextClip(
+                texto, fontsize=LEGEND_FONT_SIZE, font=LEGEND_FONT, color=NORMAL_COLOR, method="label",
+        )
+        resultado = tuple(a.copy() for a in _obter_frame_e_alpha(clip_texto))
+        clip_texto.close()
+    except Exception as err:
+        raise RuntimeError(
+            f"❌ ImageMagick: falha ao renderizar o texto da legenda ('{texto}'). "
+            f"Verifique se o ImageMagick está instalado e se a policy.xml permite "
+            f"renderização de texto (\"@*\" com rights=\"read | write\"). Erro original: {err}"
+        ) from err
+
+    _CACHE_PALAVRAS_RENDERIZADAS[chave] = resultado
+    return resultado
+
+
+def _escalar_tile(tile_rgb: np.ndarray, tile_alpha: np.ndarray, fator: float) -> Tuple[np.ndarray, np.ndarray]:
+    """Redimensiona um tile já renderizado — usado só no "pop" da palavra
+    ativa, evitando ter que re-renderizar texto via ImageMagick a cada
+    quadro da animação (o cache guarda somente a versão em 100%)."""
+    if abs(fator - 1.0) < 1e-3:
+        return tile_rgb, tile_alpha
+
+    altura, largura = tile_alpha.shape
+    nova_largura = max(1, round(largura * fator))
+    nova_altura = max(1, round(altura * fator))
+
+    img_rgb = Image.fromarray(tile_rgb).resize((nova_largura, nova_altura), Image.BILINEAR)
+    img_alpha = Image.fromarray((tile_alpha * 255).astype(np.uint8)).resize((nova_largura, nova_altura), Image.BILINEAR)
+    return np.array(img_rgb), np.array(img_alpha).astype(np.float32) / 255.0
+
+
+# ---------------------------------------------------------------------------
+# 3.2 AGRUPAMENTO VISUAL E ANIMAÇÃO (etapas 3, 4, 6 e 7)
+# ---------------------------------------------------------------------------
+def _calcular_layout_grupo(
+    grupo: List[PalavraLegenda], largura_maxima: int
+) -> Tuple[List[List[Tuple[PalavraLegenda, int, int]]], int, int]:
+    """Calcula a posição (x, y) central de cada palavra dentro do grupo.
+
+    O layout é calculado UMA ÚNICA VEZ por grupo, usando a largura da
+    palavra no estilo "normal" — por isso a posição de cada palavra não se
+    move quando ela fica ativa (mesmo com o "pop"), o que evita o efeito de
+    legenda "pulando" (etapa 7). Só quebra em mais de uma linha se o grupo
+    realmente não couber na largura disponível, e evita quebrar logo depois
+    de um artigo/preposição isolado.
+    """
+    larguras: Dict[int, int] = {}
+    altura_linha = 0
+    for palavra in grupo:
+        _, alpha = _obter_tile_palavra(palavra.palavra, "normal")
+        larguras[palavra.index] = alpha.shape[1]
+        altura_linha = max(altura_linha, alpha.shape[0])
+
+    linhas: List[List[PalavraLegenda]] = [[]]
+    largura_linha_atual = 0
+
+    for palavra in grupo:
+        largura_palavra = larguras[palavra.index]
+        espaco = LEGEND_WORD_SPACING if linhas[-1] else 0
+        cabe_na_linha = largura_linha_atual + espaco + largura_palavra <= largura_maxima
+
+        anterior_insep = (
+            linhas[-1] and _normalizar_palavra(linhas[-1][-1].palavra) in PALAVRAS_INSEPARAVEIS
+        )
+
+        if linhas[-1] and not cabe_na_linha and not anterior_insep:
+            linhas.append([])
+            largura_linha_atual = 0
+            espaco = 0
+
+        linhas[-1].append(palavra)
+        largura_linha_atual += espaco + largura_palavra
+
+    layout: List[List[Tuple[PalavraLegenda, int, int]]] = []
+    for indice_linha, linha in enumerate(linhas):
+        largura_total = sum(larguras[p.index] for p in linha) + LEGEND_WORD_SPACING * (len(linha) - 1)
+        x = (largura_maxima - largura_total) // 2
+        cy = indice_linha * (altura_linha + LEGEND_LINE_SPACING) + altura_linha // 2
+        posicoes = []
+        for palavra in linha:
+            largura_palavra = larguras[palavra.index]
+            cx = x + largura_palavra // 2
+            posicoes.append((palavra, cx, cy))
+            x += largura_palavra + LEGEND_WORD_SPACING
+        layout.append(posicoes)
+
+    return layout, altura_linha, len(linhas)
+
+
+def _desenhar_grupo(
+    frame: np.ndarray,
+    alpha: np.ndarray,
+    layout: List[List[Tuple[PalavraLegenda, int, int]]],
+    t_abs: float,
+) -> None:
+    """Desenha, num instante absoluto `t_abs`, todas as palavras do grupo.
+
+    Cada palavra fica "ativa" (amarela) assim que é pronunciada e permanece
+    assim pelo resto da exibição do grupo — só uma palavra muda de estilo
+    a cada transição (etapa 4), e o "pop" (100% -> 108% -> 100%) toca uma
+    única vez, exatamente quando a palavra se torna ativa (etapa 6).
+    """
+    for linha in layout:
+        for palavra, cx, cy in linha:
+            estilo = "ativa" if t_abs >= palavra.start else "normal"
+            tile_rgb, tile_alpha = _obter_tile_palavra(palavra.palavra, estilo)
+
+            if palavra.start <= t_abs <= palavra.start + POP_DURATION:
+                progresso = (t_abs - palavra.start) / POP_DURATION
+                fator = 1.0 + (POP_SCALE - 1.0) * math.sin(min(progresso, 1.0) * math.pi)
+                tile_rgb, tile_alpha = _escalar_tile(tile_rgb, tile_alpha, fator)
+
+            h, w = tile_alpha.shape
+            x, y = cx - w // 2, cy - h // 2
+            _colar_tile(frame, alpha, tile_rgb, tile_alpha, x, y)
+
+
+def _construir_clip_grupo(
+    grupo: List[PalavraLegenda], largura_video: int, altura_video: int
+) -> VideoClip:
+    """Constrói UM único VideoClip dinâmico para o grupo inteiro.
+
+    Em vez de empilhar vários TextClips (um por palavra por estado), o
+    grupo inteiro vira um único clip cujo `make_frame` compõe os tiles já
+    cacheados a cada quadro — poucos objetos MoviePy na composição final,
+    menos overhead de renderização.
+    """
+    largura_maxima = int(largura_video * LEGEND_WIDTH_FRACTION)
+    layout, altura_linha, num_linhas = _calcular_layout_grupo(grupo, largura_maxima)
+    altura_total = num_linhas * altura_linha + (num_linhas - 1) * LEGEND_LINE_SPACING
+
+    inicio_grupo = grupo[0].start
+    duracao_grupo = max(grupo[-1].end - inicio_grupo, 0.05)
+
+    # OTIMIZAÇÃO (gargalo real encontrado em auditoria): o MoviePy, ao
+    # compor este clip sobre o vídeo (`blit_on`), chama `get_frame(t)` e
+    # `mask.get_frame(t)` SEPARADAMENTE para o mesmo instante `t` — sem
+    # cache, `_desenhar_grupo` (com todos os lookups de tile e o resize do
+    # "pop") rodaria DUAS VEZES por frame, para cada grupo, durante o vídeo
+    # inteiro. A geração de frames do MoviePy é sequencial (confirmado no
+    # código-fonte: `ffmpeg_write_video` usa um `for t, frame in
+    # clip.iter_frames(...)` de thread única), então um cache de 1 slot por
+    # grupo é seguro e elimina o recálculo duplicado sem mudar o resultado
+    # visual (a função `blit()` do MoviePy só LÊ os arrays, nunca os muta).
+    _ultimo_quadro = {"t": None, "frame": None, "alpha": None}
+
+    def _obter_quadro_do_grupo(t: float) -> Tuple[np.ndarray, np.ndarray]:
+        if _ultimo_quadro["t"] != t:
+            t_abs = inicio_grupo + t
+            frame = np.zeros((altura_total, largura_maxima, 3), dtype=np.uint8)
+            alpha = np.zeros((altura_total, largura_maxima), dtype=np.float32)
+            _desenhar_grupo(frame, alpha, layout, t_abs)
+            _ultimo_quadro["t"] = t
+            _ultimo_quadro["frame"] = frame
+            _ultimo_quadro["alpha"] = alpha
+        return _ultimo_quadro["frame"], _ultimo_quadro["alpha"]
+
+    def make_frame(t: float) -> np.ndarray:
+        frame, _ = _obter_quadro_do_grupo(t)
+        return frame
+
+    def make_mask(t: float) -> np.ndarray:
+        _, alpha = _obter_quadro_do_grupo(t)
+        return alpha
+
+    clip_video = VideoClip(make_frame=make_frame, duration=duracao_grupo)
+    clip_mascara = VideoClip(make_frame=make_mask, duration=duracao_grupo, ismask=True)
+    clip_video = clip_video.set_mask(clip_mascara)
+
+    # Posição fixa (safe area): a base do bloco de legenda sempre no mesmo
+    # lugar, longe da borda inferior — nunca cobre elementos do Shorts nem
+    # "pula" de posição entre grupos.
+    x_video = (largura_video - largura_maxima) // 2
+    y_video = altura_video - int(altura_video * SAFE_AREA_BOTTOM) - altura_total
+    clip_video = clip_video.set_start(inicio_grupo).set_position((x_video, y_video))
+
+    return clip_video
+
+
+def _criar_clips_de_legenda(grupos: List[List[PalavraLegenda]], largura_video: int, altura_video: int) -> List[VideoClip]:
+    """Constrói o clip dinâmico de cada grupo e devolve a lista pronta para
+    entrar na composição final."""
+    return [_construir_clip_grupo(grupo, largura_video, altura_video) for grupo in grupos]
+
+
+# ---------------------------------------------------------------------------
+# 3.3 MIXAGEM DE ÁUDIO (narração + música de fundo)
+# ---------------------------------------------------------------------------
+def _carregar_musica_de_fundo(caminho: str, duracao_alvo: float) -> Optional[AudioFileClip]:
+    """Carrega a música de fundo e a ajusta à duração da narração.
+
+    Retorna `None` (com um aviso) caso o arquivo não exista ou não possa ser
+    carregado, para que o vídeo continue sendo gerado normalmente sem música.
+    """
+    if not os.path.exists(caminho):
+        print(f"⚠️ Música de fundo '{caminho}' não encontrada. Gerando vídeo sem música.")
+        return None
+
+    try:
+        musica = AudioFileClip(caminho)
+    except Exception as err:
+        print(f"⚠️ Não foi possível carregar a música '{caminho}' ({err}). Gerando vídeo sem música.")
+        return None
+
+    # Normaliza a música (baseado no trecho completo do arquivo) ANTES de
+    # cortar/repetir, para que o ganho reflita a dinâmica real da faixa.
+    # Isso faz com que músicas diferentes, com masterizações diferentes,
+    # produzam um resultado final consistente ao aplicar o mesmo MUSIC_VOLUME.
+    try:
+        musica = afx.audio_normalize(musica)
+    except Exception as err:
+        # Ex.: arquivo silencioso (max_volume=0) causaria divisão por zero.
+        print(f"⚠️ Não foi possível normalizar a música ({err}); usando volume original.")
+
+    # Ajusta a duração: repete em loop se for mais curta, corta se for maior.
+    if musica.duration < duracao_alvo:
+        if MUSIC_LOOP:
+            musica = afx.audio_loop(musica, duration=duracao_alvo)
+        # Se MUSIC_LOOP for False, a música simplesmente termina antes do
+        # fim do vídeo e o restante fica em silêncio — comportamento aceito
+        # deliberadamente, nada a processar aqui.
+    else:
+        musica = musica.subclip(0, duracao_alvo)
+
+    musica = afx.audio_fadein(musica, MUSIC_FADE_IN)
+    musica = afx.audio_fadeout(musica, MUSIC_FADE_OUT)
+    musica = afx.volumex(musica, MUSIC_VOLUME)
+
+    print("🎵 Música carregada")
+    return musica
+
+
+def _processar_narracao(clip_narracao: AudioFileClip) -> AudioFileClip:
+    """Normaliza o volume da narração e, opcionalmente, aplica um limitador leve.
+
+    A normalização (`audio_normalize`, nativo do MoviePy) é sempre aplicada e
+    evita diferenças perceptíveis de volume entre vídeos quando a narração
+    vem um pouco mais baixa — isso sozinho já resolve o principal problema
+    de consistência entre execuções.
+
+    A saturação suave em "S" (tanh) é um recurso OPCIONAL, controlado por
+    `ENABLE_SOFT_LIMITER` (desligado por padrão). Ela funciona mais como um
+    saturador/limitador leve do que um compressor de verdade (não tem
+    threshold/ratio/attack/release), e pode introduzir uma distorção
+    harmônica sutil em picos que já estão no teto após a normalização — por
+    isso fica desligada por padrão. Quando `ENABLE_SOFT_LIMITER=False`,
+    nenhum processamento adicional além da normalização e do ganho ocorre.
+    """
+    narracao = afx.audio_normalize(clip_narracao)
+
+    if ENABLE_SOFT_LIMITER:
+        drive = VOICE_COMPRESSION_DRIVE
+        limite = math.tanh(drive)  # normaliza a saída de volta para a escala original
+
+        def saturar(get_frame, t):
+            amostras = get_frame(t)
+            return np.tanh(amostras * drive) / limite
+
+        narracao = narracao.fl(saturar)
+
+    narracao = afx.volumex(narracao, VOICE_VOLUME)
+    return narracao
+
+
+def add_sound_effect(clip_audio: AudioFileClip, caminho_efeito: Optional[str] = None) -> AudioFileClip:
+    """Reservado para uso futuro: adicionar efeitos sonoros pontuais.
+
+    Por enquanto não faz nada além de devolver o áudio original — nenhum
+    efeito sonoro é utilizado nesta etapa do projeto. Mantida aqui apenas
+    como ponto de extensão para quando efeitos sonoros forem implementados.
+    """
+    return clip_audio
+
+
+def montar_audio_final(
+    clip_narracao: AudioFileClip,
+    clip_musica: Optional[AudioFileClip] = None,
+) -> CompositeAudioClip:
+    """Monta o áudio final do vídeo, misturando narração e música de fundo.
+
+    A narração é sempre normalizada (e, opcionalmente, levemente saturada) e
+    mantida como a camada mais alta da mixagem. A música (quando existir)
+    entra por baixo, em volume discreto, garantindo que a narração nunca
+    perca a clareza.
+    """
+    print("🎙 Narração carregada")
+    narracao = _processar_narracao(clip_narracao)
+    narracao = add_sound_effect(narracao)  # sem efeito por enquanto
+
+    volume_musica = MUSIC_VOLUME
+    if clip_musica is not None and volume_musica >= VOICE_VOLUME:
+        # Segurança extra: a narração deve sempre ficar mais alta que a
+        # música, mesmo que alguém ajuste as constantes de forma incorreta.
+        print("⚠️ MUSIC_VOLUME estava igual ou maior que VOICE_VOLUME; reduzindo automaticamente.")
+        volume_musica = VOICE_VOLUME * 0.3
+        clip_musica = afx.volumex(clip_musica, volume_musica / MUSIC_VOLUME)
+
+    camadas = [narracao] if clip_musica is None else [clip_musica, narracao]
+    audio_final = CompositeAudioClip(camadas).set_duration(narracao.duration)
+
+    # CompositeAudioClip não define `.fps` sozinho (é uma lacuna conhecida
+    # do MoviePy). Sem isso, qualquer código futuro que dependa de sample
+    # rate (ex.: Whisper, corte por amostra) quebraria com AttributeError.
+    audio_final.fps = getattr(clip_narracao, "fps", None) or 44100
+
+    print("🎚 Mixagem concluída")
+    return audio_final
+
+
+def criar_video(
+    roteiro_completo: str,
+    caminho_audio: str,
+    caminho_video_fundo: str,
+    caminho_saida: str = VIDEO_SAIDA_PATH,
+) -> str:
+    """Monta o vídeo final: fundo dinâmico (Ken Burns), legendas, barra de
+    progresso, vinheta e fades, cortado em 9:16."""
+    print("🎬 [3/4] Montando vídeo final com legendas dinâmicas e design pro...")
+
+    # Referências guardadas à parte para garantir o fechamento de todos os
+    # clips abertos, mesmo em caso de erro no meio do processo.
+    clips_para_fechar: List = []
+
+    try:
+        if not os.path.exists(caminho_video_fundo):
+            raise FileNotFoundError(
+                f"❌ Vídeo de fundo '{caminho_video_fundo}' não encontrado."
+            )
+        try:
+            clip_video = VideoFileClip(caminho_video_fundo)
+        except Exception as err:
+            raise RuntimeError(
+                f"❌ Vídeo de fundo '{caminho_video_fundo}' corrompido ou ilegível: {err}"
+            ) from err
+        clips_para_fechar.append(clip_video)
+
+        clip_audio = AudioFileClip(caminho_audio)
+        clips_para_fechar.append(clip_audio)
+
+        duracao_final = clip_audio.duration
+
+        if not duracao_final or duracao_final <= 0:
+            raise ValueError(
+                f"Narração com duração inválida ({duracao_final}s) — "
+                f"verifique se '{caminho_audio}' foi gerado corretamente."
+            )
+
+        clip_musica = _carregar_musica_de_fundo(MUSICA_PATH, duracao_final)
+        if clip_musica is not None:
+            clips_para_fechar.append(clip_musica)
+
+        audio_final = montar_audio_final(clip_audio, clip_musica)
+        clips_para_fechar.append(audio_final)
+
+        # Loop do vídeo de fundo caso o áudio seja mais longo que o vídeo.
+        if clip_video.duration < duracao_final:
+            num_loops = math.ceil(duracao_final / clip_video.duration)
+            clip_video_loop = concatenate_videoclips([clip_video] * num_loops)
+            clips_para_fechar.append(clip_video_loop)
+            clip_video = clip_video_loop
+
+        clip_video = clip_video.subclip(0, duracao_final)
+        clip_video = _redimensionar_para_vertical(clip_video)
+
+        # Transcreve a narração (sempre a voz limpa, antes da mixagem com
+        # música) e agrupa as palavras em blocos de legenda sincronizados.
+        _resetar_cache_legendas()
+        palavras = transcrever_narracao(caminho_audio)
+        grupos = agrupar_palavras_em_blocos(palavras)
+        pontos_de_corte = [grupo[0].start for grupo in grupos]
+
+        # Fundo dinâmico: zoom lento contínuo + variação de zoom a cada
+        # grupo de legenda + leve pan, sempre dentro dos limites da imagem
+        # (sem bordas pretas).
+        fundo_dinamico = _aplicar_ken_burns(clip_video, duracao_final, pontos_de_corte)
+        clips_para_fechar.append(fundo_dinamico)
+
+        fundo_com_vinheta = _aplicar_vinheta(fundo_dinamico)
+        largura_final, altura_final = fundo_com_vinheta.size
+
+        text_clips = _criar_clips_de_legenda(grupos, largura_final, altura_final)
+        clips_para_fechar.extend(text_clips)
+        barra_progresso = _criar_barra_progresso(largura_final, duracao_final)
+        clips_para_fechar.append(barra_progresso)
+
+        total_tiles = len(_CACHE_PALAVRAS_RENDERIZADAS)
+        total_consultas = _estatisticas_cache["acertos"] + _estatisticas_cache["faltas"]
+        taxa_cache = (_estatisticas_cache["acertos"] / total_consultas * 100) if total_consultas else 0.0
+        print(f"✨ {len(palavras)} animações")
+        print(f"⚡ Cache reutilizado: {taxa_cache:.0f}% ({total_tiles} tiles únicos renderizados)")
+
+        video_final = CompositeVideoClip(
+            [fundo_com_vinheta] + text_clips + [barra_progresso],
+            size=(largura_final, altura_final),
+        )
+        clips_para_fechar.append(video_final)
+
+        # Abertura e fechamento suaves — aplicados tanto no vídeo quanto no
+        # áudio, para que a mixagem não corte abruptamente enquanto a tela
+        # já está escurecendo (bug encontrado em auditoria: antes, apenas o
+        # vídeo tinha fade, e o áudio continuava no volume máximo até o
+        # último frame).
+        video_final = video_final.fx(vfx.fadein, FADE_TIME).fx(vfx.fadeout, FADE_TIME)
+        audio_final = afx.audio_fadein(audio_final, FADE_TIME)
+        audio_final = afx.audio_fadeout(audio_final, FADE_TIME)
+        video_final = video_final.set_audio(audio_final)
+
+        print("⏳ Renderizando vídeo...")
+        inicio_render = time.perf_counter()
+        video_final.write_videofile(
+            caminho_saida,
+            codec="libx264",
+            audio_codec="aac",
+            preset=RENDER_PRESET,
+            bitrate=RENDER_BITRATE,
+            threads=RENDER_THREADS,
+            logger=None,
+        )
+        print(f"🎬 Render concluído em {time.perf_counter() - inicio_render:.2f}s")
+
+        return caminho_saida
+
+    finally:
+        # Libera todos os recursos abertos, evitando processos/arquivos presos.
+        for clip in reversed(clips_para_fechar):
+            try:
+                clip.close()
+            except Exception:
+                pass  # nunca deixa um erro de limpeza mascarar o erro original
+
+
+# ===========================================================================
+# 4. UPLOAD YOUTUBE (Descrição Otimizada)
+# ===========================================================================
+def upload_youtube(caminho_video: str, titulo: str, roteiro: str) -> str:
+    """Publica o vídeo final no YouTube Shorts e retorna o ID do vídeo."""
+    print("🚀 [4/4] Enviando o vídeo para o YouTube Shorts...")
+
+    token_json_str = os.environ.get("YOUTUBE_TOKEN_JSON")
+    if not token_json_str:
+        raise RuntimeError("❌ Upload: variável de ambiente YOUTUBE_TOKEN_JSON não configurada.")
+
+    try:
+        info_token = json.loads(token_json_str)
+    except json.JSONDecodeError as err:
+        raise RuntimeError(f"❌ Upload: YOUTUBE_TOKEN_JSON não é um JSON válido ({err}).") from err
+
+    try:
+        credentials = Credentials.from_authorized_user_info(info_token)
+        youtube = build("youtube", "v3", credentials=credentials)
+
+        descricao = YOUTUBE_DESCRICAO_TEMPLATE.format(roteiro=roteiro)
+
+        body = {
+            "snippet": {
+                "title": titulo,
+                "description": descricao,
+                "tags": YOUTUBE_TAGS,
+                "categoryId": YOUTUBE_CATEGORY_ID,
+            },
+            "status": {
+                "privacyStatus": "public",
+                "selfDeclaredMadeForKids": False,
+            },
+        }
+
+        media = MediaFileUpload(caminho_video, chunksize=-1, resumable=True)
+        request = youtube.videos().insert(part=",".join(body.keys()), body=body, media_body=media)
+        resposta = request.execute()
+    except Exception as err:
+        # Cobre credenciais inválidas/expiradas, quota excedida, falha de
+        # rede durante o upload resumível, etc.
+        raise RuntimeError(f"❌ Upload: falha ao publicar no YouTube ({err}).") from err
+
+    video_id = resposta["id"]
+    print(f"✅ Sucesso! Vídeo publicado com o ID: {video_id}")
+    return video_id
+
+
+# ===========================================================================
+# 5. PRÓXIMAS FASES (TODO) — apenas documentado, NADA implementado
+# ===========================================================================
+# Os itens abaixo são pontos de extensão conhecidos para as próximas fases
+# do projeto. Nenhum deles tem código funcional ainda — são só notas de
+# onde cada um se encaixaria na arquitetura atual, para acelerar o design
+# quando a fase correspondente começar.
+#
+# TODO (Diretor Cinematográfico): uma camada de decisão que escolheria
+#   dinamicamente ritmo de corte, enquadramento e intensidade do Ken Burns
+#   com base no conteúdo do roteiro (ex: mais estático em trechos
+#   explicativos, mais dinâmico em ganchos). Se encaixaria entre
+#   `agrupar_palavras_em_blocos()` e `_aplicar_ken_burns()`, informando os
+#   `pontos_de_corte` e os níveis de zoom em vez de usar `BLOCK_ZOOM_LEVELS`
+#   fixo.
+#
+# TODO (Banco de vídeos / Banco de músicas / Banco de efeitos sonoros /
+#   Banco de thumbnails): hoje `VIDEO_FUNDO_PATH` e `MUSICA_PATH` são
+#   caminhos fixos de um único arquivo. Um "banco" substituiria isso por uma
+#   fonte de múltiplos arquivos (pasta local, bucket, etc.) da qual o bot
+#   escolheria um item por execução. `add_sound_effect()` (seção 3.3) já
+#   existe como stub exatamente para o dia em que o banco de efeitos sonoros
+#   for implementado.
+#
+# TODO (IA escolhendo música / fundo / efeitos / thumbnail / voz): uma vez
+#   que os "bancos" acima existam, a escolha entre os itens de cada banco
+#   poderia ser feita por um modelo (ou heurística) em vez de aleatória —
+#   plugaria como uma função `escolher_*(roteiro, banco) -> item`, chamada
+#   antes de `criar_video()`/`upload_youtube()`.
+#
+# TODO (Múltiplos provedores de TTS): `gerar_audio()` está fortemente
+#   acoplada à ElevenLabs. Generalizar exigiria extrair uma interface comum
+#   (texto -> arquivo de áudio) e uma constante tipo `TTS_PROVIDER` para
+#   escolher entre provedores, com fallback entre eles (mesmo padrão já
+#   usado para `MODEL_PRIORITY` do Gemini).
+#
+# TODO (Cache inteligente): já existe um cache local por execução
+#   (`_CACHE_PALAVRAS_RENDERIZADAS`, seção 3.1) para tiles de legenda. Uma
+#   fase futura poderia persistir esse cache entre execuções (ex: palavras
+#   muito comuns do canal) — precisaria de um armazenamento persistente,
+#   que é exatamente o próximo TODO.
+#
+# TODO (Banco SQLite / Histórico de vídeos / Banco de prompts / Sistema
+#   anti-repetição): hoje cada execução é independente e sem memória do que
+#   já foi publicado, então nada impede o Gemini de gerar um tema muito
+#   parecido com um vídeo recente. Um banco SQLite local guardaria
+#   título/tema/roteiro de cada vídeo publicado; `_montar_prompt_roteiro()`
+#   (seção 1) passaria a receber um resumo dos últimos N temas para orientar
+#   o Gemini a evitar repetição, e `upload_youtube()` gravaria o resultado
+#   no banco após o sucesso do upload.
+#
+# Nenhum dos itens acima tem qualquer dependência nova instalada nem
+# qualquer código funcional nesta versão — são apenas TODOs documentados.
+
+
+# ===========================================================================
+# EXECUÇÃO PRINCIPAL
+# ===========================================================================
+def _formatar_linha_log(nome: str, status: str, duracao: float) -> str:
+    """Formata uma linha de log alinhada por pontos, ex.: '🧠 Gemini ... OK (2.30s)'."""
+    pontos = max(3, LARGURA_LOG_TEMPOS - len(nome))
+    return f"{nome} {'.' * pontos} {status} ({duracao:.2f}s)"
+
+
+def _ram_aproximada_mb() -> float:
+    """RAM aproximada (pico de uso do processo) via stdlib, sem dependências
+    novas. `ru_maxrss` vem em KB no Linux."""
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+
+
+def _rodar_etapa(nome: str, tempos: Dict[str, float], func, *args, **kwargs):
+    """Executa uma etapa do pipeline, cronometrando e logando OK/❌ no
+    formato padronizado. Em caso de falha, relança o erro (com o nome da
+    etapa no início da mensagem, ex. '❌ Gemini: ...') para que `main()`
+    interrompa o pipeline — as etapas são sequenciais e dependentes."""
+    inicio = time.perf_counter()
+    try:
+        resultado = func(*args, **kwargs)
+    except Exception as err:
+        duracao = time.perf_counter() - inicio
+        tempos[nome] = duracao
+        print(_formatar_linha_log(nome, "FALHOU", duracao))
+        mensagem_err = str(err)
+        if mensagem_err.startswith("❌"):
+            # A etapa interna (ex: Whisper, ImageMagick) já identificou a si
+            # mesma — evita duplicar o marcador, só adiciona o contexto.
+            raise RuntimeError(f"❌ {nome} (via {mensagem_err[2:]})") from err
+        raise RuntimeError(f"❌ {nome}: {err}") from err
+
+    duracao = time.perf_counter() - inicio
+    tempos[nome] = duracao
+    print(_formatar_linha_log(nome, "OK", duracao))
+    return resultado
+
+
+def _log_tempos(tempos: Dict[str, float]) -> None:
+    """Imprime o resumo final: tempo total e RAM aproximada utilizada."""
+    print("\n⏱️  Resumo de tempos:")
+    for etapa, duracao in tempos.items():
+        pontos = max(3, LARGURA_LOG_TEMPOS - len(etapa))
+        print(f"{etapa} {'.' * pontos} {duracao:.2f}s")
+    print(f"💾 RAM aproximada (pico) {'.' * max(3, LARGURA_LOG_TEMPOS - 24)} {_ram_aproximada_mb():.0f} MB")
+
+
+def main() -> None:
+    """Executa o pipeline completo: roteiro -> áudio -> vídeo -> upload."""
+    inicio_total = time.perf_counter()
+    tempos: Dict[str, float] = {}
+
+    try:
+        titulo, roteiro = _rodar_etapa("🧠 Gemini", tempos, gerar_roteiro)
+        audio_path = _rodar_etapa("🎙 ElevenLabs", tempos, gerar_audio, roteiro)
+        video_path = _rodar_etapa("🎬 Render", tempos, criar_video, roteiro, audio_path, VIDEO_FUNDO_PATH)
+        _rodar_etapa("🚀 Upload", tempos, upload_youtube, video_path, titulo, roteiro)
+
+    except Exception as err:
+        print(f"\n{err}")
+        tempos["🏁 Total (com erro)"] = time.perf_counter() - inicio_total
+        _log_tempos(tempos)
+        raise SystemExit(1)
+
+    else:
+        tempos["🏁 Total"] = time.perf_counter() - inicio_total
+        _log_tempos(tempos)
+
+    finally:
+        # Remove arquivos temporários independentemente do resultado.
+        if os.path.exists(NARRACAO_PATH):
+            os.remove(NARRACAO_PATH)
+
+
+if __name__ == "__main__":
+    main()
