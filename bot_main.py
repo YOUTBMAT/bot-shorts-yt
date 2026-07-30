@@ -599,16 +599,25 @@ def _aplicar_ken_burns(
     clip: VideoFileClip,
     duracao_total: float,
     pontos_de_corte: List[float],
-) -> CompositeVideoClip:
+) -> VideoClip:
     """Aplica um efeito Ken Burns sutil: zoom lento contínuo + zoom por segmento.
 
-    O vídeo nunca fica completamente parado: combina um zoom lento e
-    constante ao longo de todo o vídeo com uma leve variação de zoom a cada
-    troca de legenda (usando os tempos reais de início de cada grupo,
-    vindos da transcrição), além de um pan (movimento horizontal e
-    vertical) muito discreto. O deslocamento é sempre limitado (clampado) à
-    margem real disponível na imagem ampliada, então nunca aparecem bordas
-    pretas.
+    IMPLEMENTAÇÃO AUTO-CONTIDA (reescrita após um bug de renderização): em
+    vez de usar `.resize()` + `.set_position()` compostos dentro de um
+    `CompositeVideoClip` — que acaba embrulhado em máscaras aninhadas pelo
+    MoviePy e pode dessincronizar o tamanho da imagem com a posição
+    calculada — este Ken Burns usa um único `make_frame` autossuficiente:
+    a cada instante, recorta uma janela do frame ORIGINAL (nas dimensões
+    reais do vídeo de fundo, já em 9:16) e amplia essa janela para
+    EXATAMENTE o tamanho do canvas.
+
+    Isso garante, por construção (não por "clamp" após o fato):
+    - a janela de recorte NUNCA sai dos limites do frame original (as
+      coordenadas de recorte são sempre calculadas dentro de [0, folga]);
+    - o frame de saída tem SEMPRE exatamente `canvas_w x canvas_h`, porque
+      é o próprio alvo do resize final — nunca "menor que o canvas";
+    - não há bordas pretas possíveis, pois nunca existe um "canvas vazio"
+      por trás — cada frame é 100% preenchido pelo recorte redimensionado.
     """
     canvas_w, canvas_h = clip.size
 
@@ -623,49 +632,58 @@ def _aplicar_ken_burns(
     direcao_x = random.choice([-1, 1])
     direcao_y = random.choice([-1, 1])
 
-    # Mesmo padrão de cache usado nas legendas: `escala(t)` normalmente
-    # seria chamada duas vezes por frame (uma pelo `resize`, outra pela
-    # `posicao`, ambas para o mesmo `t`). O ganho aqui é bem menor do que
-    # nas legendas (é só um `bisect` + algumas contas), mas ainda é uma
-    # duplicação real, então corrigimos pelo mesmo motivo.
-    _ultima_escala = {"t": None, "valor": None}
+    def fator_zoom(t: float) -> float:
+        """Fator de zoom (sempre >= 1.0): zoom lento contínuo + zoom por
+        segmento, somados de forma aditiva para ficar sempre sutil."""
+        zoom_bloco = sequencia_zoom[indice_do_segmento(t)]
+        progresso_geral = min(t / duracao_total, 1.0) if duracao_total > 0 else 0.0
+        zoom_lento = 1.0 + (KEN_BURNS_ZOOM_MAX - 1.0) * progresso_geral
+        return max(1.0, 1.0 + (zoom_bloco - 1.0) + (zoom_lento - 1.0))
 
-    def escala(t: float) -> float:
-        if _ultima_escala["t"] != t:
-            zoom_bloco = sequencia_zoom[indice_do_segmento(t)]
-            progresso_geral = min(t / duracao_total, 1.0) if duracao_total > 0 else 0.0
-            zoom_lento = 1.0 + (KEN_BURNS_ZOOM_MAX - 1.0) * progresso_geral
-            # Soma aditiva (em vez de multiplicativa) para manter o zoom
-            # total sempre dentro de uma faixa previsível e sutil.
-            _ultima_escala["t"] = t
-            _ultima_escala["valor"] = 1.0 + (zoom_bloco - 1.0) + (zoom_lento - 1.0)
-        return _ultima_escala["valor"]
+    def make_frame(t: float) -> np.ndarray:
+        frame_original = clip.get_frame(t)
+        altura_original, largura_original = frame_original.shape[:2]
+        fator = fator_zoom(t)
 
-    clip_com_zoom = clip.resize(escala)
+        # Janela de recorte, em pixels do frame ORIGINAL. Como fator >= 1,
+        # a janela é sempre <= ao frame original (nunca precisa "inventar"
+        # pixels fora dele).
+        crop_w = min(largura_original, max(1, int(round(largura_original / fator))))
+        crop_h = min(altura_original, max(1, int(round(altura_original / fator))))
 
-    def posicao(t: float) -> Tuple[float, float]:
-        fator = escala(t)
-        largura_atual = canvas_w * fator
-        altura_atual = canvas_h * fator
-
-        margem_x = max((largura_atual - canvas_w) / 2, 0.0)
-        margem_y = max((altura_atual - canvas_h) / 2, 0.0)
+        folga_x = largura_original - crop_w  # quanto a janela pode "andar" na horizontal
+        folga_y = altura_original - crop_h   # quanto pode "andar" na vertical
 
         progresso_pan = (min(t / duracao_total, 1.0) - 0.5) * 2 if duracao_total > 0 else 0.0
-        offset_x = direcao_x * PAN_MAX_FRACTION * canvas_w * progresso_pan
-        offset_y = direcao_y * PAN_MAX_FRACTION * canvas_h * progresso_pan
 
-        # Nunca deixa o deslocamento revelar bordas: limita à margem real.
-        offset_x = max(-margem_x, min(margem_x, offset_x))
-        offset_y = max(-margem_y, min(margem_y, offset_y))
+        # Deslocamento desejado (na escala do canvas final, para manter a
+        # mesma sensação de movimento configurada em PAN_MAX_FRACTION),
+        # convertido para o espaço do frame original e travado dentro da
+        # folga REAL disponível — nunca pode ultrapassar os limites do
+        # frame original, então nunca revela "vazio".
+        desloc_x_desejado = (direcao_x * PAN_MAX_FRACTION * canvas_w * progresso_pan) / fator
+        desloc_y_desejado = (direcao_y * PAN_MAX_FRACTION * canvas_h * progresso_pan) / fator
+        limite_x = folga_x / 2
+        limite_y = folga_y / 2
+        desloc_x = max(-limite_x, min(limite_x, desloc_x_desejado))
+        desloc_y = max(-limite_y, min(limite_y, desloc_y_desejado))
 
-        x = (canvas_w - largura_atual) / 2 + offset_x
-        y = (canvas_h - altura_atual) / 2 + offset_y
-        return (x, y)
+        x0 = int(round(folga_x / 2 + desloc_x))
+        y0 = int(round(folga_y / 2 + desloc_y))
+        x0 = max(0, min(x0, folga_x))
+        y0 = max(0, min(y0, folga_y))
 
-    clip_com_zoom = clip_com_zoom.set_position(posicao)
+        recorte = frame_original[y0:y0 + crop_h, x0:x0 + crop_w]
 
-    return CompositeVideoClip([clip_com_zoom], size=(canvas_w, canvas_h)).set_duration(duracao_total)
+        if recorte.shape[1] == canvas_w and recorte.shape[0] == canvas_h:
+            return recorte
+
+        imagem_final = Image.fromarray(recorte).resize((canvas_w, canvas_h), Image.BILINEAR)
+        return np.array(imagem_final)
+
+    clip_ken_burns = VideoClip(make_frame=make_frame, duration=duracao_total)
+    clip_ken_burns.fps = getattr(clip, "fps", None) or 24
+    return clip_ken_burns
 
 
 def _aplicar_vinheta(clip: CompositeVideoClip, intensidade: float = VIGNETTE_INTENSITY) -> CompositeVideoClip:
