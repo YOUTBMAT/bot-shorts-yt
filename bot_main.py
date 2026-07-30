@@ -39,7 +39,6 @@ from moviepy.editor import (
     CompositeVideoClip,
     concatenate_videoclips,
 )
-import moviepy.video.fx.all as vfx
 import moviepy.audio.fx.all as afx
 from googleapiclient.discovery import build
 from google.oauth2.credentials import Credentials
@@ -57,6 +56,7 @@ MODEL_PRIORITY: List[str] = ["gemini-2.5-flash", "gemini-3.6-flash"]
 MAX_RETRIES: int = 2  # tentativas por modelo antes de passar para o próximo
 ROTEIRO_MIN_PALAVRAS: int = 65
 ROTEIRO_MAX_PALAVRAS: int = 85
+ROTEIRO_TOLERANCIA_PALAVRAS: int = 15  # margem aceita além do min/max antes de rejeitar o roteiro
 TITULO_MAX_CARACTERES: int = 90
 RETRY_BACKOFF_BASE: float = 1.0  # segundos; dobra a cada nova tentativa (1, 2, 4...)
 RETRY_BACKOFF_JITTER: float = 0.5  # variação aleatória (0 a X segundos) somada à espera
@@ -72,6 +72,16 @@ VIDEO_FUNDO_PATH: str = "fundo.mp4"
 VIDEO_SAIDA_PATH: str = "video_final.mp4"
 VIDEO_WIDTH: int = 1080
 ASPECT_RATIO: float = 9 / 16  # formato vertical (Shorts)
+CROP_OFFSET_MAX_FRACTION: float = 0.35  # quanto do espaço sobrando o corte pode usar p/ não centralizar
+DURACAO_MINIMA_SEGURANCA: float = 0.05  # segundos; piso usado contra timestamps/durações degeneradas
+
+# --- Identidade visual (cor de destaque compartilhada) ---
+# Uma ÚNICA cor de destaque usada tanto nas legendas quanto na barra de
+# progresso, para que os dois elementos pareçam parte do mesmo projeto (um
+# amarelo puro nas legendas e um dourado na barra, como era antes, lia como
+# duas identidades visuais diferentes coexistindo por acaso).
+ACCENT_COLOR_HEX: str = "#FFD100"   # dourado quente, usado no texto ativo
+ACCENT_COLOR_RGB: Tuple[int, int, int] = (255, 209, 0)  # mesmo tom, para a barra
 
 # --- Legendas sincronizadas por palavra (faster-whisper) ---
 TRANSCRIPTION_ENGINE: str = "faster-whisper"
@@ -81,7 +91,7 @@ WHISPER_LANGUAGE: str = "pt"
 LEGEND_FONT: str = "DejaVu-Sans-Bold"
 LEGEND_FONT_SIZE: int = 58
 NORMAL_COLOR: str = "white"
-ACTIVE_COLOR: str = "yellow"
+ACTIVE_COLOR: str = ACCENT_COLOR_HEX
 STROKE_COLOR: str = "black"
 STROKE_WIDTH: int = 3
 LEGEND_SHADOW_OFFSET: Tuple[int, int] = (3, 4)  # deslocamento (x, y) da sombra em px
@@ -100,21 +110,22 @@ PAUSA_MINIMA_QUEBRA: float = 0.35  # segundos; pausa que sugere quebra natural d
 KEN_BURNS_ZOOM_MAX: float = 1.03  # zoom lento e contínuo ao longo do vídeo inteiro
 BLOCK_ZOOM_LEVELS: List[float] = [1.00, 1.05, 1.08, 1.03]  # varia a cada troca de legenda
 PAN_MAX_FRACTION: float = 0.035  # deslocamento horizontal/vertical máx. (fração da tela)
+ZOOM_TRANSICAO_DURACAO: float = 0.4  # segundos; suaviza a troca de nível de zoom entre grupos
 
 # --- Fade de abertura/fechamento ---
 FADE_TIME: float = 0.4  # segundos (entre 0.3 e 0.5, conforme especificado)
 
 # --- Barra de progresso ---
 BAR_HEIGHT: int = 6  # px (entre 5 e 8, conforme especificado)
-BAR_COLOR: Tuple[int, int, int] = (255, 209, 0)
+BAR_COLOR: Tuple[int, int, int] = ACCENT_COLOR_RGB  # mesma cor de destaque das legendas
 BAR_BACKGROUND_COLOR: Tuple[int, int, int] = (35, 35, 35)
 BAR_OPACITY: float = 0.9
 
 # --- Vinheta ---
-VIGNETTE_INTENSITY: float = 0.22  # 0 (nenhuma) a 1 (forte); mantido bem sutil
+VIGNETTE_INTENSITY: float = 0.14  # 0 (nenhuma) a 1 (forte); reduzida para ficar mais discreta
 
 # --- Renderização ---
-RENDER_PRESET: str = "medium"
+RENDER_PRESET: str = "fast"  # ~25% mais rápido que "medium" no mesmo bitrate, sem perda perceptível
 RENDER_BITRATE: str = "8000k"
 RENDER_THREADS: int = 4
 
@@ -127,6 +138,7 @@ MUSIC_FADE_OUT: float = 0.8  # segundos (entre 0.5 e 1.0)
 MUSIC_LOOP: bool = True  # repete a música automaticamente se ela for mais curta
 ENABLE_SOFT_LIMITER: bool = False  # compressão/saturação (tanh) é opcional; ver nota abaixo
 VOICE_COMPRESSION_DRIVE: float = 1.35  # intensidade da saturação, só usada se ENABLE_SOFT_LIMITER=True
+MUSIC_VOLUME_FALLBACK_FRACTION: float = 0.3  # fração de VOICE_VOLUME usada se MUSIC_VOLUME estiver mal configurado
 
 # --- Logs ---
 LARGURA_LOG_TEMPOS: int = 22  # largura usada para alinhar os "...." no resumo de tempos
@@ -251,7 +263,9 @@ def _validar_roteiro(dados: dict) -> Tuple[str, str]:
         titulo = titulo[: TITULO_MAX_CARACTERES - 1].rstrip() + "…"
 
     num_palavras = len(roteiro.split())
-    if not (ROTEIRO_MIN_PALAVRAS - 15 <= num_palavras <= ROTEIRO_MAX_PALAVRAS + 15):
+    if not (ROTEIRO_MIN_PALAVRAS - ROTEIRO_TOLERANCIA_PALAVRAS
+            <= num_palavras
+            <= ROTEIRO_MAX_PALAVRAS + ROTEIRO_TOLERANCIA_PALAVRAS):
         # Fora de uma margem razoável: provavelmente o modelo ignorou a regra.
         raise ValueError(f"Roteiro fora do tamanho esperado ({num_palavras} palavras).")
 
@@ -473,7 +487,7 @@ def transcrever_narracao(caminho_audio: str) -> List[PalavraLegenda]:
 
                 inicio_p, fim_p = float(palavra_w.start), float(palavra_w.end)
                 if fim_p <= inicio_p:
-                    fim_p = inicio_p + 0.05  # segurança contra timestamps degenerados
+                    fim_p = inicio_p + DURACAO_MINIMA_SEGURANCA  # segurança contra timestamps degenerados
 
                 palavras.append(PalavraLegenda(
                     palavra=texto,
@@ -550,9 +564,10 @@ def _escolher_posicao_de_corte(sobra: float) -> float:
     """
     if sobra <= 0:
         return 0.0
-    # Desloca até ~35% da folga disponível para um dos lados, nunca cortando
-    # de forma extrema. O sinal (esquerda/direita ou cima/baixo) é aleatório.
-    deslocamento_max = sobra * 0.35
+    # Desloca até CROP_OFFSET_MAX_FRACTION da folga disponível para um dos
+    # lados, nunca cortando de forma extrema. O sinal (esquerda/direita ou
+    # cima/baixo) é aleatório.
+    deslocamento_max = sobra * CROP_OFFSET_MAX_FRACTION
     return random.uniform(-deslocamento_max, deslocamento_max)
 
 
@@ -579,6 +594,18 @@ def _redimensionar_para_vertical(clip: VideoFileClip) -> VideoFileClip:
         clip = clip.crop(x1=0, y1=y1, width=w, height=nova_altura)
 
     return clip.resize(width=VIDEO_WIDTH)
+
+
+def _ease_suave(x: float) -> float:
+    """Curva de suavização (smoothstep clássico: 3x²-2x³).
+
+    Mapeia [0,1] -> [0,1], mas com velocidade zero nas duas pontas — dá uma
+    sensação de aceleração/desaceleração suave em vez de velocidade
+    constante. Custo desprezível (duas multiplicações), usada no Ken Burns
+    e no fade do vídeo para uma sensação mais "editada à mão".
+    """
+    x = 0.0 if x < 0.0 else (1.0 if x > 1.0 else x)
+    return x * x * (3.0 - 2.0 * x)
 
 
 def _sequencia_zoom_por_bloco(quantidade_blocos: int) -> List[float]:
@@ -618,6 +645,13 @@ def _aplicar_ken_burns(
       é o próprio alvo do resize final — nunca "menor que o canvas";
     - não há bordas pretas possíveis, pois nunca existe um "canvas vazio"
       por trás — cada frame é 100% preenchido pelo recorte redimensionado.
+
+    O zoom contínuo e o pan usam uma curva suave (`_ease_suave`) em vez de
+    velocidade linear constante, e a troca de nível de zoom entre grupos de
+    legenda é uma transição curta e suave (`ZOOM_TRANSICAO_DURACAO`) em vez
+    de um degrau instantâneo — dá uma sensação de câmera "respirando" em
+    vez de saltando, sem nenhum custo extra de renderização (é a mesma
+    quantidade de operações por quadro, só com uma curva diferente).
     """
     canvas_w, canvas_h = clip.size
 
@@ -635,8 +669,24 @@ def _aplicar_ken_burns(
     def fator_zoom(t: float) -> float:
         """Fator de zoom (sempre >= 1.0): zoom lento contínuo + zoom por
         segmento, somados de forma aditiva para ficar sempre sutil."""
-        zoom_bloco = sequencia_zoom[indice_do_segmento(t)]
-        progresso_geral = min(t / duracao_total, 1.0) if duracao_total > 0 else 0.0
+        idx = indice_do_segmento(t)
+        zoom_alvo = sequencia_zoom[idx]
+
+        # Suaviza a troca de nível de zoom: nos primeiros
+        # ZOOM_TRANSICAO_DURACAO segundos de um novo segmento, interpola do
+        # nível anterior até o novo em vez de saltar instantaneamente.
+        if idx > 0:
+            tempo_no_segmento = t - limites[idx]
+            if tempo_no_segmento < ZOOM_TRANSICAO_DURACAO:
+                zoom_anterior = sequencia_zoom[idx - 1]
+                progresso_transicao = _ease_suave(tempo_no_segmento / ZOOM_TRANSICAO_DURACAO)
+                zoom_bloco = zoom_anterior + (zoom_alvo - zoom_anterior) * progresso_transicao
+            else:
+                zoom_bloco = zoom_alvo
+        else:
+            zoom_bloco = zoom_alvo
+
+        progresso_geral = _ease_suave(min(t / duracao_total, 1.0)) if duracao_total > 0 else 0.0
         zoom_lento = 1.0 + (KEN_BURNS_ZOOM_MAX - 1.0) * progresso_geral
         return max(1.0, 1.0 + (zoom_bloco - 1.0) + (zoom_lento - 1.0))
 
@@ -654,7 +704,8 @@ def _aplicar_ken_burns(
         folga_x = largura_original - crop_w  # quanto a janela pode "andar" na horizontal
         folga_y = altura_original - crop_h   # quanto pode "andar" na vertical
 
-        progresso_pan = (min(t / duracao_total, 1.0) - 0.5) * 2 if duracao_total > 0 else 0.0
+        progresso_pan_linear = min(t / duracao_total, 1.0) if duracao_total > 0 else 0.0
+        progresso_pan = (_ease_suave(progresso_pan_linear) - 0.5) * 2
 
         # Deslocamento desejado (na escala do canvas final, para manter a
         # mesma sensação de movimento configurada em PAN_MAX_FRACTION),
@@ -707,14 +758,59 @@ def _aplicar_vinheta(clip: CompositeVideoClip, intensidade: float = VIGNETTE_INT
     return clip.fl_image(aplicar_mascara)
 
 
+def _aplicar_fade_video_suave(clip: CompositeVideoClip, duracao_fade: float) -> CompositeVideoClip:
+    """Fade de abertura/fechamento com curva suave (`_ease_suave`) em vez da
+    rampa linear padrão do MoviePy (`vfx.fadein`/`vfx.fadeout`).
+
+    Mesmo custo por quadro do fade padrão (uma multiplicação do frame por
+    um escalar) — só muda a curva do escalar, então não há impacto
+    perceptível no tempo de renderização. Feito num único `fl()` para
+    entrada e saída juntas, em vez de dois `.fx()` encadeados.
+    """
+    duracao_total = clip.duration
+
+    def fator_fade(t: float) -> float:
+        if t < duracao_fade:
+            return _ease_suave(t / duracao_fade)
+        tempo_restante = duracao_total - t
+        if tempo_restante < duracao_fade:
+            return _ease_suave(tempo_restante / duracao_fade)
+        return 1.0
+
+    def transformar(get_frame, t):
+        frame = get_frame(t)
+        fator = fator_fade(t)
+        if fator >= 1.0:
+            return frame
+        return (frame.astype(np.float32) * fator).astype("uint8")
+
+    return clip.fl(transformar, keep_duration=True)
+
+
 def _criar_barra_progresso(largura: int, duracao: float) -> VideoClip:
     """Cria uma barra de progresso fina e elegante no topo do vídeo."""
 
     def make_frame(t: float) -> np.ndarray:
         frame = np.empty((BAR_HEIGHT, largura, 3), dtype=np.uint8)
         frame[:, :] = BAR_BACKGROUND_COLOR
-        progresso_px = int(largura * min(t / duracao, 1.0)) if duracao > 0 else 0
-        frame[:, :progresso_px] = BAR_COLOR
+
+        progresso_exato = largura * min(t / duracao, 1.0) if duracao > 0 else 0.0
+        progresso_px = int(progresso_exato)
+        fracao = progresso_exato - progresso_px  # parte sub-pixel da borda de avanço
+
+        if progresso_px > 0:
+            frame[:, :progresso_px] = BAR_COLOR
+
+        # Mistura o pixel exatamente na borda proporcionalmente à fração —
+        # sem isso, a borda "pula" um pixel inteiro por vez (visível como um
+        # leve serrilhado/tremor após a compressão do vídeo). Custo: um
+        # único pixel de largura calculado por quadro, desprezível.
+        if fracao > 0 and progresso_px < largura:
+            frame[:, progresso_px] = [
+                int(bg * (1 - fracao) + fg * fracao)
+                for bg, fg in zip(BAR_BACKGROUND_COLOR, BAR_COLOR)
+            ]
+
         return frame
 
     barra = VideoClip(make_frame=make_frame, duration=duracao)
@@ -951,7 +1047,7 @@ def _construir_clip_grupo(
     altura_total = num_linhas * altura_linha + (num_linhas - 1) * LEGEND_LINE_SPACING
 
     inicio_grupo = grupo[0].start
-    duracao_grupo = max(grupo[-1].end - inicio_grupo, 0.05)
+    duracao_grupo = max(grupo[-1].end - inicio_grupo, DURACAO_MINIMA_SEGURANCA)
 
     # OTIMIZAÇÃO (gargalo real encontrado em auditoria): o MoviePy, ao
     # compor este clip sobre o vídeo (`blit_on`), chama `get_frame(t)` e
@@ -1113,7 +1209,7 @@ def montar_audio_final(
         # Segurança extra: a narração deve sempre ficar mais alta que a
         # música, mesmo que alguém ajuste as constantes de forma incorreta.
         print("⚠️ MUSIC_VOLUME estava igual ou maior que VOICE_VOLUME; reduzindo automaticamente.")
-        volume_musica = VOICE_VOLUME * 0.3
+        volume_musica = VOICE_VOLUME * MUSIC_VOLUME_FALLBACK_FRACTION
         clip_musica = afx.volumex(clip_musica, volume_musica / MUSIC_VOLUME)
 
     camadas = [narracao] if clip_musica is None else [clip_musica, narracao]
@@ -1221,7 +1317,7 @@ def criar_video(
         # já está escurecendo (bug encontrado em auditoria: antes, apenas o
         # vídeo tinha fade, e o áudio continuava no volume máximo até o
         # último frame).
-        video_final = video_final.fx(vfx.fadein, FADE_TIME).fx(vfx.fadeout, FADE_TIME)
+        video_final = _aplicar_fade_video_suave(video_final, FADE_TIME)
         audio_final = afx.audio_fadein(audio_final, FADE_TIME)
         audio_final = afx.audio_fadeout(audio_final, FADE_TIME)
         video_final = video_final.set_audio(audio_final)
@@ -1399,7 +1495,8 @@ def _log_tempos(tempos: Dict[str, float]) -> None:
     for etapa, duracao in tempos.items():
         pontos = max(3, LARGURA_LOG_TEMPOS - len(etapa))
         print(f"{etapa} {'.' * pontos} {duracao:.2f}s")
-    print(f"💾 RAM aproximada (pico) {'.' * max(3, LARGURA_LOG_TEMPOS - 24)} {_ram_aproximada_mb():.0f} MB")
+    rotulo_ram = "💾 RAM aproximada (pico)"
+    print(f"{rotulo_ram} {'.' * max(3, LARGURA_LOG_TEMPOS - len(rotulo_ram))} {_ram_aproximada_mb():.0f} MB")
 
 
 def main() -> None:
