@@ -116,10 +116,10 @@ ZOOM_TRANSICAO_DURACAO: float = 0.4  # segundos; suaviza a troca de nível de zo
 FADE_TIME: float = 0.4  # segundos (entre 0.3 e 0.5, conforme especificado)
 
 # --- Barra de progresso ---
-BAR_HEIGHT: int = 6  # px (entre 5 e 8, conforme especificado)
+BAR_HEIGHT: int = 5  # px (entre 5 e 8, conforme especificado; reduzido de 6 para menos presença)
 BAR_COLOR: Tuple[int, int, int] = ACCENT_COLOR_RGB  # mesma cor de destaque das legendas
 BAR_BACKGROUND_COLOR: Tuple[int, int, int] = (35, 35, 35)
-BAR_OPACITY: float = 0.9
+BAR_OPACITY: float = 0.65  # reduzida de 0.9: a barra era o único elemento "sempre ligado" do vídeo
 
 # --- Vinheta ---
 VIGNETTE_INTENSITY: float = 0.14  # 0 (nenhuma) a 1 (forte); reduzida para ficar mais discreta
@@ -788,13 +788,30 @@ def _aplicar_fade_video_suave(clip: CompositeVideoClip, duracao_fade: float) -> 
 
 
 def _criar_barra_progresso(largura: int, duracao: float) -> VideoClip:
-    """Cria uma barra de progresso fina e elegante no topo do vídeo."""
+    """Cria uma barra de progresso fina e elegante no topo do vídeo.
+
+    A barra só começa a avançar depois que o fade de abertura termina, e
+    chega aos 100% exatamente quando o fade de fechamento começa — assim
+    "progresso completo" e "tela escurecendo" acontecem como um único
+    gesto, em vez de dois eventos quase simultâneos mas descoordenados.
+    Reaproveita FADE_TIME, que já é conhecido nesse ponto — nenhum cálculo
+    novo caro, só desloca a janela em que o avanço acontece.
+    """
+    inicio_avanco = FADE_TIME
+    fim_avanco = max(inicio_avanco + 0.01, duracao - FADE_TIME)
+    duracao_avanco = fim_avanco - inicio_avanco
 
     def make_frame(t: float) -> np.ndarray:
         frame = np.empty((BAR_HEIGHT, largura, 3), dtype=np.uint8)
         frame[:, :] = BAR_BACKGROUND_COLOR
 
-        progresso_exato = largura * min(t / duracao, 1.0) if duracao > 0 else 0.0
+        if t <= inicio_avanco:
+            progresso_exato = 0.0
+        elif t >= fim_avanco:
+            progresso_exato = float(largura)
+        else:
+            progresso_exato = largura * (t - inicio_avanco) / duracao_avanco
+
         progresso_px = int(progresso_exato)
         fracao = progresso_exato - progresso_px  # parte sub-pixel da borda de avanço
 
@@ -1294,6 +1311,22 @@ def criar_video(
 
         fundo_com_vinheta = _aplicar_vinheta(fundo_dinamico)
         largura_final, altura_final = fundo_com_vinheta.size
+
+        # Verificação estrutural (custo de 1 frame, desprezível perto do
+        # render inteiro): confirma que o fundo realmente preenche 100% do
+        # canvas antes de prosseguir. Isso não "esconde" um eventual bug de
+        # faixa preta — pelo contrário, faz a renderização falhar alto e
+        # claro, com a causa exata, em vez de produzir silenciosamente um
+        # vídeo com borda preta que só seria percebido ao assistir.
+        _frame_teste = fundo_com_vinheta.get_frame(min(0.5, duracao_final / 2))
+        _altura_real, _largura_real = _frame_teste.shape[:2]
+        if (_largura_real, _altura_real) != (largura_final, altura_final):
+            raise RuntimeError(
+                f"❌ Inconsistência de tamanho no fundo do vídeo: o frame renderizado "
+                f"tem {_largura_real}x{_altura_real}px, mas o canvas esperado é "
+                f"{largura_final}x{altura_final}px. Isso indicaria uma regressão no "
+                f"Ken Burns/vinheta — pare e investigue antes de publicar."
+            )
 
         text_clips = _criar_clips_de_legenda(grupos, largura_final, altura_final)
         clips_para_fechar.extend(text_clips)
