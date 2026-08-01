@@ -124,6 +124,13 @@ BAR_OPACITY: float = 0.65  # reduzida de 0.9: a barra era o único elemento "sem
 # --- Vinheta ---
 VIGNETTE_INTENSITY: float = 0.14  # 0 (nenhuma) a 1 (forte); reduzida para ficar mais discreta
 
+# --- Modo de diagnóstico (instrumentação da pipeline de vídeo) ---
+# Quando DEBUG_RENDER=False (padrão), todo o custo é um único `if` por
+# chamada — não abre arquivo, não salva PNG, não imprime nada.
+DEBUG_RENDER: bool = False
+DEBUG_RENDER_DIR: str = "debug_render"  # pasta onde os frames/logs de diagnóstico são salvos
+DEBUG_RENDER_INSTANTE_FRACAO: float = 0.5  # em que ponto da duração salvar o frame (50% por padrão)
+
 # --- Renderização ---
 RENDER_PRESET: str = "fast"  # ~25% mais rápido que "medium" no mesmo bitrate, sem perda perceptível
 RENDER_BITRATE: str = "8000k"
@@ -511,6 +518,51 @@ def transcrever_narracao(caminho_audio: str) -> List[PalavraLegenda]:
 FINAIS_DE_FRASE = {".", "!", "?", "…"}
 
 
+def _limitar_palavras_a_duracao(
+    palavras: List[PalavraLegenda], duracao_maxima: float
+) -> Tuple[List[PalavraLegenda], int]:
+    """Garante que nenhuma palavra transcrita ultrapasse a duração real do
+    áudio/vídeo final.
+
+    Timestamps além da duração real acontecem de verdade com o Whisper —
+    silêncio residual, comportamento do VAD, ou uma pequena diferença entre
+    a duração decodificada do áudio e sua duração real. Sem esse limite, as
+    legendas geradas a partir desses timestamps fazem a composição final
+    "esticar" além do fundo (Ken Burns), e o `CompositeVideoClip` passa a
+    exibir preto sólido (seu `bg_color` padrão) nos instantes em que o
+    fundo já não está mais "tocando" — a causa raiz confirmada de uma faixa
+    quase totalmente preta perto do fim do vídeo.
+
+    Esta é a correção na fonte: valida os dados assim que chegam da
+    transcrição, então tudo que é derivado deles (agrupamento, legendas,
+    pontos de corte do Ken Burns) já nasce consistente — não precisa de
+    nenhum ajuste ou "offset" espalhado por outras funções.
+
+    Retorna a lista corrigida e a quantidade de palavras que precisaram de
+    algum ajuste (descartadas ou só com o timestamp encurtado) — usado só
+    para o log, não afeta o comportamento.
+    """
+    limite_inicio = max(0.0, duracao_maxima - DURACAO_MINIMA_SEGURANCA)
+    resultado: List[PalavraLegenda] = []
+    quantidade_ajustada = 0
+
+    for palavra in palavras:
+        novo_start = min(palavra.start, limite_inicio)
+        novo_end = min(palavra.end, duracao_maxima)
+        if novo_end <= novo_start:
+            quantidade_ajustada += 1
+            continue  # a palavra ficaria com duração zero/negativa após o corte; descarta
+
+        if novo_start != palavra.start or novo_end != palavra.end:
+            quantidade_ajustada += 1
+        palavra.start = novo_start
+        palavra.end = novo_end
+        palavra.duration = novo_end - novo_start
+        resultado.append(palavra)
+
+    return resultado, quantidade_ajustada
+
+
 def agrupar_palavras_em_blocos(palavras: List[PalavraLegenda]) -> List[List[PalavraLegenda]]:
     """Agrupa as palavras em blocos de MIN_GROUP_WORDS a MAX_GROUP_WORDS,
     fechando o grupo preferencialmente em fim de frase ou pausa natural —
@@ -554,6 +606,70 @@ def agrupar_palavras_em_blocos(palavras: List[PalavraLegenda]) -> List[List[Pala
 # 3. EDITAR VÍDEO (MoviePy + Legendas Dinâmicas)
 # ===========================================================================
 
+def _debug_registrar(etapa: str, clip, instante: Optional[float] = None) -> None:
+    """Registra o estado de um clip da pipeline no modo de diagnóstico.
+
+    Só faz alguma coisa quando `DEBUG_RENDER=True` (o custo, desligado, é um
+    único `if` por chamada). Quando ligado, imprime tipo do clip, tamanho,
+    duração, fps e posição, lista os subclipes se for um
+    `CompositeVideoClip`, e salva um frame PNG no mesmo instante relativo
+    (por padrão, 50% da duração) em `DEBUG_RENDER_DIR/<etapa>.png` — assim
+    dá pra abrir os PNGs de todas as etapas lado a lado e ver exatamente em
+    qual delas o frame deixa de preencher o canvas.
+    """
+    if not DEBUG_RENDER:
+        return
+
+    os.makedirs(DEBUG_RENDER_DIR, exist_ok=True)
+
+    tipo = type(clip).__name__
+    largura, altura = clip.size if getattr(clip, "size", None) else (None, None)
+    duracao = getattr(clip, "duration", None)
+    fps = getattr(clip, "fps", None)
+
+    if instante is None:
+        instante = (duracao * DEBUG_RENDER_INSTANTE_FRACAO) if duracao else 0.0
+    if duracao:
+        instante = max(0.0, min(instante, duracao - 0.001))
+    else:
+        instante = 0.0
+
+    pos_str = "n/d"
+    pos_fn = getattr(clip, "pos", None)
+    if pos_fn is not None:
+        try:
+            pos_str = str(pos_fn(instante))
+        except Exception as err:
+            pos_str = f"erro ao ler pos(): {err}"
+
+    print(f"🔍 [DEBUG_RENDER] {etapa}")
+    print(f"    tipo={tipo}  tamanho={largura}x{altura}  duracao={duracao}  fps={fps}")
+    print(f"    posicao em t={instante:.2f}s: {pos_str}")
+
+    if isinstance(clip, CompositeVideoClip):
+        print(f"    subclipes ({len(clip.clips)}):")
+        for i, sub in enumerate(clip.clips):
+            sub_tamanho = getattr(sub, "size", None)
+            sub_start = getattr(sub, "start", None)
+            print(f"      [{i}] tipo={type(sub).__name__} tamanho={sub_tamanho} start={sub_start}")
+
+    try:
+        frame = clip.get_frame(instante)
+        altura_real, largura_real = frame.shape[0], frame.shape[1]
+        bate = (largura_real, altura_real) == (largura, altura)
+        print(
+            f"    frame real em t={instante:.2f}s: shape={frame.shape}  "
+            f"bate com o tamanho declarado ({largura}x{altura})? {bate}"
+        )
+
+        caminho_png = os.path.join(DEBUG_RENDER_DIR, f"{etapa}.png")
+        Image.fromarray(frame).save(caminho_png)
+        print(f"    frame salvo em: {caminho_png}")
+    except Exception as err:
+        print(f"    ⚠️ não foi possível capturar/salvar o frame desta etapa: {err}")
+
+    print()
+
 
 def _escolher_posicao_de_corte(sobra: float) -> float:
     """Escolhe um deslocamento de corte agradável em vez de sempre centralizar.
@@ -593,7 +709,13 @@ def _redimensionar_para_vertical(clip: VideoFileClip) -> VideoFileClip:
         y1 = max(0, min(y1, h - nova_altura))
         clip = clip.crop(x1=0, y1=y1, width=w, height=nova_altura)
 
-    return clip.resize(width=VIDEO_WIDTH)
+    _debug_registrar("02_crop", clip)
+
+    clip = clip.resize(width=VIDEO_WIDTH)
+
+    _debug_registrar("03_resize", clip)
+
+    return clip
 
 
 def _ease_suave(x: float) -> float:
@@ -1267,6 +1389,7 @@ def criar_video(
                 f"❌ Vídeo de fundo '{caminho_video_fundo}' corrompido ou ilegível: {err}"
             ) from err
         clips_para_fechar.append(clip_video)
+        _debug_registrar("01_abertura", clip_video)
 
         clip_audio = AudioFileClip(caminho_audio)
         clips_para_fechar.append(clip_audio)
@@ -1292,6 +1415,9 @@ def criar_video(
             clip_video_loop = concatenate_videoclips([clip_video] * num_loops)
             clips_para_fechar.append(clip_video_loop)
             clip_video = clip_video_loop
+            _debug_registrar("04_loop", clip_video)
+        else:
+            _debug_registrar("04_loop_nao_necessario", clip_video)
 
         clip_video = clip_video.subclip(0, duracao_final)
         clip_video = _redimensionar_para_vertical(clip_video)
@@ -1300,6 +1426,12 @@ def criar_video(
         # música) e agrupa as palavras em blocos de legenda sincronizados.
         _resetar_cache_legendas()
         palavras = transcrever_narracao(caminho_audio)
+        palavras, _quantidade_ajustada = _limitar_palavras_a_duracao(palavras, duracao_final)
+        if _quantidade_ajustada:
+            print(
+                f"⚠️ {_quantidade_ajustada} palavra(s) com timestamp além da duração real "
+                f"do áudio ({duracao_final:.2f}s) foram ajustadas/descartadas."
+            )
         grupos = agrupar_palavras_em_blocos(palavras)
         pontos_de_corte = [grupo[0].start for grupo in grupos]
 
@@ -1308,9 +1440,11 @@ def criar_video(
         # (sem bordas pretas).
         fundo_dinamico = _aplicar_ken_burns(clip_video, duracao_final, pontos_de_corte)
         clips_para_fechar.append(fundo_dinamico)
+        _debug_registrar("05_ken_burns", fundo_dinamico)
 
         fundo_com_vinheta = _aplicar_vinheta(fundo_dinamico)
         largura_final, altura_final = fundo_com_vinheta.size
+        _debug_registrar("06_vinheta", fundo_com_vinheta)
 
         # Verificação estrutural (custo de 1 frame, desprezível perto do
         # render inteiro): confirma que o fundo realmente preenche 100% do
@@ -1330,8 +1464,36 @@ def criar_video(
 
         text_clips = _criar_clips_de_legenda(grupos, largura_final, altura_final)
         clips_para_fechar.extend(text_clips)
+        if DEBUG_RENDER and text_clips:
+            # Legendas variam ao longo do vídeo (cada grupo é um clip
+            # diferente, com seu próprio intervalo de tempo); registra o
+            # primeiro grupo como amostra representativa da etapa.
+            _debug_registrar("07_legendas", text_clips[0])
+
         barra_progresso = _criar_barra_progresso(largura_final, duracao_final)
         clips_para_fechar.append(barra_progresso)
+
+        # Segunda verificação estrutural (defesa em profundidade): confirma
+        # que NENHUM subclipe (legenda, barra) se estende além da duração
+        # real do áudio. Essa é exatamente a classe de bug encontrada e
+        # corrigida nesta rodada — timestamps de transcrição que ultrapassam
+        # a duração real faziam o CompositeVideoClip final "esticar" além do
+        # fundo, sobrando tela preta no final. `_limitar_palavras_a_duracao`
+        # já corrige isso na fonte; esta verificação existe para pegar
+        # qualquer regressão futura (nesta função ou em qualquer nova
+        # funcionalidade) antes que ela vire um vídeo publicado quebrado.
+        _tolerancia_duracao = 0.05
+        for _clip_verificado in [fundo_com_vinheta, barra_progresso] + text_clips:
+            _fim_clip = (getattr(_clip_verificado, "start", 0.0) or 0.0) + _clip_verificado.duration
+            if _fim_clip > duracao_final + _tolerancia_duracao:
+                raise RuntimeError(
+                    f"❌ Inconsistência de duração: um subclipe (tipo "
+                    f"{type(_clip_verificado).__name__}) termina em {_fim_clip:.2f}s, além "
+                    f"da duração real do áudio ({duracao_final:.2f}s). Isso faria o vídeo "
+                    f"final mostrar tela preta no trecho excedente — pare e investigue "
+                    f"antes de publicar."
+                )
+        _debug_registrar("08_barra_progresso", barra_progresso)
 
         total_tiles = len(_CACHE_PALAVRAS_RENDERIZADAS)
         total_consultas = _estatisticas_cache["acertos"] + _estatisticas_cache["faltas"]
@@ -1344,6 +1506,7 @@ def criar_video(
             size=(largura_final, altura_final),
         )
         clips_para_fechar.append(video_final)
+        _debug_registrar("09_composite_final", video_final)
 
         # Abertura e fechamento suaves — aplicados tanto no vídeo quanto no
         # áudio, para que a mixagem não corte abruptamente enquanto a tela
@@ -1354,6 +1517,7 @@ def criar_video(
         audio_final = afx.audio_fadein(audio_final, FADE_TIME)
         audio_final = afx.audio_fadeout(audio_final, FADE_TIME)
         video_final = video_final.set_audio(audio_final)
+        _debug_registrar("10_antes_do_write_videofile", video_final)
 
         print("⏳ Renderizando vídeo...")
         inicio_render = time.perf_counter()
