@@ -671,6 +671,75 @@ def _debug_registrar(etapa: str, clip, instante: Optional[float] = None) -> None
     print()
 
 
+def _debug_inspecionar_clip(indice, clip, instante: float = 0.0) -> None:
+    """Imprime os atributos detalhados de UM clip: tipo, size, mask, start,
+    end, position, relative_pos, ismask. Usado para vasculhar clip a clip
+    dentro de uma composição, procurando qualquer um que destoe dos demais
+    (tamanho diferente, posição deslocada, etc.)."""
+    tipo = type(clip).__name__
+    tamanho = getattr(clip, "size", None)
+    tem_mask = getattr(clip, "mask", None) is not None
+    start = getattr(clip, "start", None)
+    end = getattr(clip, "end", None)
+    duracao = getattr(clip, "duration", None)
+    ismask = getattr(clip, "ismask", None)
+    relative_pos = getattr(clip, "relative_pos", None)
+
+    pos_valor = "n/d"
+    pos_fn = getattr(clip, "pos", None)
+    if pos_fn is not None:
+        try:
+            pos_valor = pos_fn(instante)
+        except Exception as err:
+            pos_valor = f"erro: {err}"
+
+    print(
+        f"  [{indice}] tipo={tipo} size={tamanho} mask={tem_mask} ismask={ismask} "
+        f"start={start} end={end} duracao={duracao} pos={pos_valor} relative_pos={relative_pos}"
+    )
+
+
+def _debug_registrar_composicao(etapa: str, video_final: CompositeVideoClip, instante: Optional[float] = None) -> None:
+    """Versão detalhada de `_debug_registrar`, específica para o
+    CompositeVideoClip final: além do resumo padrão, inspeciona TODOS os
+    subclipes com `_debug_inspecionar_clip` e imprime o `bg_color` e o
+    `transparent` do composite — que é quem decide se sobra 'fundo preto'
+    aparecendo atrás de algum clip."""
+    if not DEBUG_RENDER:
+        return
+
+    _debug_registrar(etapa, video_final, instante)
+
+    if instante is None:
+        instante = (video_final.duration * DEBUG_RENDER_INSTANTE_FRACAO) if video_final.duration else 0.0
+
+    print(f"🔍 [DEBUG_RENDER] {etapa} — inspeção clip a clip:")
+    print(f"    CompositeVideoClip.size (o que define o canvas final) = {video_final.size}")
+    print(f"    bg_color = {getattr(video_final, 'bg_color', 'n/d')}")
+    for i, sub in enumerate(video_final.clips):
+        _debug_inspecionar_clip(i, sub, instante)
+    print()
+
+
+def _debug_aplicar_borda_canvas(clip, espessura: int = 4, cor=(255, 0, 0)):
+    """Desenha uma borda diretamente NOS PIXELS do frame final, exatamente
+    nas bordas do canvas do clip — não é um overlay separado, é o próprio
+    array de pixels do frame que recebe a borda. Usado só em investigação
+    (DEBUG_RENDER=True) para visualizar onde o MoviePy acredita que o vídeo
+    termina, mesmo que o conteúdo real não preencha até lá."""
+
+    def aplicar(frame: np.ndarray) -> np.ndarray:
+        frame = frame.copy()
+        e = min(espessura, frame.shape[0] // 2, frame.shape[1] // 2)
+        frame[:e, :] = cor
+        frame[-e:, :] = cor
+        frame[:, :e] = cor
+        frame[:, -e:] = cor
+        return frame
+
+    return clip.fl_image(aplicar)
+
+
 def _escolher_posicao_de_corte(sobra: float) -> float:
     """Escolhe um deslocamento de corte agradável em vez de sempre centralizar.
 
@@ -1363,6 +1432,48 @@ def montar_audio_final(
     return audio_final
 
 
+def _verificar_fundo_saudavel(clip: VideoFileClip, fracao_preta_maxima: float = 0.25) -> None:
+    """Verifica se o vídeo de fundo já chega com uma região de preto sólido
+    grande demais.
+
+    Isso NÃO corrige nada — é uma checagem do ARQUIVO DE ENTRADA. Vídeos
+    processados por ferramentas externas de conversão de proporção (que
+    costumam adicionar barras pretas em vez de cortar) chegam com preto já
+    embutido nos próprios pixels; nosso Ken Burns/crop então recorta e
+    reproduz fielmente essa região preta, porque ela faz parte do conteúdo,
+    não é um bug de composição. Sem esse aviso, o único jeito de descobrir
+    isso é abrindo o arquivo final publicado e vendo a barra preta.
+
+    Custo: lê e varre 3 linhas de UM frame — desprezível perto do render
+    inteiro.
+    """
+    if not clip.duration:
+        return
+
+    frame = clip.get_frame(min(clip.duration / 2, max(0.0, clip.duration - 0.01)))
+    altura, largura = frame.shape[:2]
+
+    piores_fracoes = []
+    for fracao_y in (0.25, 0.5, 0.75):
+        linha = frame[int(altura * fracao_y)]
+        pretos = int((linha.mean(axis=1) <= 10).sum())
+        piores_fracoes.append(pretos / largura)
+
+    fracao_preta = max(piores_fracoes)
+    if fracao_preta > fracao_preta_maxima:
+        print(
+            f"⚠️ O vídeo de fundo '{VIDEO_FUNDO_PATH}' já contém uma região preta "
+            f"sólida grande (~{fracao_preta * 100:.0f}% da largura, medida em 3 "
+            f"linhas do frame). Isso normalmente indica que o arquivo já foi "
+            f"processado por outra ferramenta ANTES de chegar aqui (ex: um "
+            f"conversor de proporção que adiciona barras pretas em vez de "
+            f"cortar). Nosso pipeline vai recortar/dar zoom fielmente nesse "
+            f"conteúdo, incluindo a parte preta — não é um bug de composição "
+            f"nosso. Recomendado: abra '{VIDEO_FUNDO_PATH}' direto num player "
+            f"para confirmar antes de publicar."
+        )
+
+
 def criar_video(
     roteiro_completo: str,
     caminho_audio: str,
@@ -1390,6 +1501,7 @@ def criar_video(
             ) from err
         clips_para_fechar.append(clip_video)
         _debug_registrar("01_abertura", clip_video)
+        _verificar_fundo_saudavel(clip_video)
 
         clip_audio = AudioFileClip(caminho_audio)
         clips_para_fechar.append(clip_audio)
@@ -1506,7 +1618,7 @@ def criar_video(
             size=(largura_final, altura_final),
         )
         clips_para_fechar.append(video_final)
-        _debug_registrar("09_composite_final", video_final)
+        _debug_registrar_composicao("09_composite_final", video_final)
 
         # Abertura e fechamento suaves — aplicados tanto no vídeo quanto no
         # áudio, para que a mixagem não corte abruptamente enquanto a tela
@@ -1518,6 +1630,19 @@ def criar_video(
         audio_final = afx.audio_fadeout(audio_final, FADE_TIME)
         video_final = video_final.set_audio(audio_final)
         _debug_registrar("10_antes_do_write_videofile", video_final)
+
+        if DEBUG_RENDER:
+            # Desenha uma borda vermelha diretamente nos pixels do frame,
+            # exatamente nas bordas do canvas que o MoviePy acredita que o
+            # vídeo tem — não é um overlay: se o conteúdo real não chegar
+            # até a borda vermelha, o preto "sobrando" fica visualmente
+            # isolado entre o conteúdo e a moldura, mostrando exatamente
+            # onde o problema está.
+            os.makedirs(DEBUG_RENDER_DIR, exist_ok=True)
+            _clip_com_borda = _debug_aplicar_borda_canvas(video_final)
+            _caminho_borda = os.path.join(DEBUG_RENDER_DIR, "11_com_borda_vermelha.png")
+            Image.fromarray(_clip_com_borda.get_frame(video_final.duration / 2)).save(_caminho_borda)
+            print(f"🔍 [DEBUG_RENDER] frame com borda vermelha salvo em: {_caminho_borda}")
 
         print("⏳ Renderizando vídeo...")
         inicio_render = time.perf_counter()
