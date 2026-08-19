@@ -21,6 +21,11 @@ import random
 import bisect
 import unicodedata
 import resource
+import urllib.request
+import urllib.error
+import urllib.parse
+import socket
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict
 
@@ -68,12 +73,39 @@ ELEVENLABS_TIMEOUT_SECONDS: float = 120.0  # evita que uma chamada travada prend
 NARRACAO_PATH: str = "narracao.mp3"
 
 # --- Vídeo (MoviePy) ---
-VIDEO_FUNDO_PATH: str = "fundo.mp4"
+VIDEO_FUNDO_PATH: str = "fundo.mp4"  # fallback legado: usado só se a biblioteca de mídia estiver vazia
 VIDEO_SAIDA_PATH: str = "video_final.mp4"
 VIDEO_WIDTH: int = 1080
 ASPECT_RATIO: float = 9 / 16  # formato vertical (Shorts)
 CROP_OFFSET_MAX_FRACTION: float = 0.35  # quanto do espaço sobrando o corte pode usar p/ não centralizar
 DURACAO_MINIMA_SEGURANCA: float = 0.05  # segundos; piso usado contra timestamps/durações degeneradas
+
+# --- Biblioteca de mídia (MediaManager) ---
+MEDIA_VIDEOS_DIR: str = "assets/videos"  # pode ter subpastas por tema (minecraft/, parkour/, ...)
+MEDIA_IMAGENS_DIR: str = "assets/imagens"
+MEDIA_EXTENSOES_VIDEO = {".mp4", ".mov", ".mkv", ".webm"}
+MEDIA_EXTENSOES_IMAGEM = {".jpg", ".jpeg", ".png", ".webp"}
+MEDIA_VIDEO_DURACAO_MINIMA: float = 5.0  # segundos; vídeos mais curtos são ignorados
+MEDIA_HISTORICO_PATH: str = "media_history.json"  # últimas mídias usadas, para não repetir
+MEDIA_HISTORICO_TAMANHO: int = 10  # quantos últimos usados guardar/evitar repetir
+MEDIA_MAX_TENTATIVAS: int = 3  # quantos arquivos diferentes tentar antes de desistir
+
+# --- Provedor remoto: Pexels (opcional — só ativa se PEXELS_API_KEY existir) ---
+# A chave NUNCA fica no código: só é lida da variável de ambiente abaixo.
+PEXELS_API_KEY_ENV_VAR: str = "PEXELS_API_KEY"
+PEXELS_API_URL: str = "https://api.pexels.com/videos/search"
+PEXELS_MAX_RESULTS: int = 15  # quantos resultados pedir na busca (antes de filtrar/baixar)
+PEXELS_MAX_DOWNLOADS: int = 6  # nunca baixa mais que isso por execução (pedido: entre 4 e 6)
+PEXELS_MIN_DOWNLOADS_DESEJADOS: int = 4
+PEXELS_TIMEOUT_SECONDS: float = 15.0  # por requisição (busca OU download de 1 arquivo)
+PEXELS_ORIENTACAO: str = "landscape"  # priorizamos 16:9, cortado depois para 9:16 no pipeline
+PEXELS_FPS_PREFERIDO: int = 30
+PEXELS_RESOLUCAO_PREFERIDA: Tuple[int, int] = (1920, 1080)
+MIN_WIDTH: int = 1280  # ignora automaticamente vídeos com resolução menor que essa
+CACHE_DIR: str = "cache/pexels"
+CACHE_METADATA_PATH: str = "cache/pexels/metadata.json"
+CACHE_TTL_HOURS: float = 24.0  # depois disso, o cache expira e pode baixar de novo
+MAX_PALAVRAS_CHAVE_PESQUISA: int = 4  # quantas palavras-chave extrair do roteiro
 
 # --- Identidade visual (cor de destaque compartilhada) ---
 # Uma ÚNICA cor de destaque usada tanto nas legendas quanto na barra de
@@ -183,6 +215,241 @@ PALAVRAS_CHAVE = {
     "primeiro", "primeira", "ultimo", "ultima",
     "recorde", "ano", "anos",
 }
+
+
+
+
+# ===========================================================================
+# 0. BIBLIOTECA DE MÍDIA (MediaManager)
+# ===========================================================================
+class FundoInvalidoError(RuntimeError):
+    """Erro específico para quando o vídeo de fundo está ausente, vazio ou
+    corrompido. Separado de RuntimeError genérico de propósito: permite que
+    quem chama `criar_video()` saiba que é seguro descartar esse arquivo e
+    tentar outro da biblioteca de mídia, sem precisar interpretar o texto
+    da mensagem de erro."""
+
+
+# Responsabilidade única: gerenciar a pasta local de vídeos/imagens de
+# fundo. NÃO baixa nada, NÃO usa IA, NÃO faz nenhuma análise pesada de
+# conteúdo (sem OpenCV, sem modelos) — só olha extensão de arquivo, tamanho
+# em bytes e (apenas no candidato efetivamente escolhido) a duração real do
+# vídeo. Isso é o suficiente para "validar" no sentido pedido (ignorar
+# arquivo vazio/corrompido/curto demais) sem pesar no tempo de execução.
+@dataclass
+class MediaItem:
+    """Um item da biblioteca de mídia: caminho, subpasta de origem
+    (usada só como categoria informativa, não para nenhuma lógica de
+    IA/tema) e tipo ("video" ou "imagem")."""
+    caminho: str
+    categoria: str
+    tipo: str
+
+
+class MediaManager:
+    """Escolhe automaticamente um vídeo (ou imagem, já preparado para o
+    futuro) de fundo a partir de uma biblioteca local de arquivos.
+
+    Único responsável por: listar vídeos/imagens, validar arquivos (de
+    forma leve), escolher aleatoriamente evitando repetir os últimos
+    usados, e devolver o caminho escolhido. Nada além disso — não edita
+    vídeo, não decide efeito, não sabe nada sobre Ken Burns/legendas.
+
+    Escaneia cada pasta apenas uma vez por execução (resultado cacheado em
+    memória em `self._videos`/`self._imagens`); chamadas repetidas a
+    `listar_videos()` não tocam o disco de novo.
+    """
+
+    def __init__(
+        self,
+        pasta_videos: str = MEDIA_VIDEOS_DIR,
+        pasta_imagens: str = MEDIA_IMAGENS_DIR,
+        arquivo_historico: str = MEDIA_HISTORICO_PATH,
+    ) -> None:
+        self.pasta_videos = pasta_videos
+        self.pasta_imagens = pasta_imagens
+        self.arquivo_historico = arquivo_historico
+        self._videos: Optional[List[MediaItem]] = None  # cache: só escaneia na 1ª chamada
+        self._imagens: Optional[List[MediaItem]] = None
+        self._historico: List[str] = self._carregar_historico()
+
+    # --- listagem (com cache em memória) --------------------------------
+    def listar_videos(self) -> List[MediaItem]:
+        """Lista os vídeos válidos da biblioteca (escaneia o disco só na
+        primeira chamada). Se a biblioteca estiver vazia, cai de volta para
+        o único arquivo legado `VIDEO_FUNDO_PATH`, se ele existir — assim
+        um projeto que ainda não montou a pasta `assets/videos/` continua
+        funcionando exatamente como antes, sem nenhuma configuração extra.
+        """
+        if self._videos is not None:
+            return self._videos
+
+        videos = self._escanear(self.pasta_videos, MEDIA_EXTENSOES_VIDEO, "video")
+
+        if not videos and os.path.exists(VIDEO_FUNDO_PATH) and self._validacao_leve(VIDEO_FUNDO_PATH):
+            print(
+                f"ℹ️ Biblioteca de mídia vazia em '{self.pasta_videos}'; "
+                f"usando o arquivo legado '{VIDEO_FUNDO_PATH}'."
+            )
+            videos = [MediaItem(caminho=VIDEO_FUNDO_PATH, categoria="legado", tipo="video")]
+
+        self._videos = videos
+        return self._videos
+
+    def listar_imagens(self) -> List[MediaItem]:
+        """Lista as imagens válidas da biblioteca (escaneia só uma vez).
+        Preparado para uso futuro — nada no pipeline atual consome imagens
+        como fundo ainda."""
+        if self._imagens is None:
+            self._imagens = self._escanear(self.pasta_imagens, MEDIA_EXTENSOES_IMAGEM, "imagem")
+        return self._imagens
+
+    def _escanear(self, pasta: str, extensoes: set, tipo: str) -> List[MediaItem]:
+        itens: List[MediaItem] = []
+        if not os.path.isdir(pasta):
+            return itens
+
+        for raiz, _subpastas, arquivos in os.walk(pasta):
+            categoria = os.path.relpath(raiz, pasta)
+            categoria = "" if categoria == "." else categoria
+            for nome in arquivos:
+                if os.path.splitext(nome)[1].lower() not in extensoes:
+                    continue
+                caminho = os.path.join(raiz, nome)
+                if not self._validacao_leve(caminho):
+                    continue
+                itens.append(MediaItem(caminho=caminho, categoria=categoria, tipo=tipo))
+
+        return itens
+
+    # --- validação --------------------------------------------------------
+    def _validacao_leve(self, caminho: str) -> bool:
+        """Validação barata, aplicada a TODA a biblioteca durante o escaneio:
+        só confirma que o arquivo existe e não está vazio. Não abre o vídeo
+        (isso seria caro demais para repetir em toda a biblioteca)."""
+        try:
+            return os.path.getsize(caminho) > 0
+        except OSError:
+            return False
+
+    def _validar_video(self, caminho: str) -> bool:
+        """Validação completa — só é chamada no candidato JÁ SORTEADO, nunca
+        na biblioteca inteira: consegue abrir e tem pelo menos
+        MEDIA_VIDEO_DURACAO_MINIMA segundos."""
+        clip = None
+        try:
+            clip = VideoFileClip(caminho)
+            return bool(clip.duration and clip.duration >= MEDIA_VIDEO_DURACAO_MINIMA)
+        except Exception:
+            return False
+        finally:
+            if clip is not None:
+                clip.close()
+
+    def _validar_imagem(self, caminho: str) -> bool:
+        """Validação completa de imagem — mesmo princípio: só é chamada no
+        candidato sorteado, usando PIL (já é dependência do projeto)."""
+        try:
+            with Image.open(caminho) as img:
+                img.verify()
+            return True
+        except Exception:
+            return False
+
+    # --- histórico / diversidade ------------------------------------------
+    def _carregar_historico(self) -> List[str]:
+        if not os.path.exists(self.arquivo_historico):
+            return []
+        try:
+            with open(self.arquivo_historico, "r", encoding="utf-8") as arquivo:
+                dados = json.load(arquivo)
+            if isinstance(dados, list):
+                return [str(item) for item in dados]
+        except (OSError, json.JSONDecodeError):
+            pass
+        return []
+
+    def _salvar_historico(self) -> None:
+        try:
+            with open(self.arquivo_historico, "w", encoding="utf-8") as arquivo:
+                json.dump(self._historico[-MEDIA_HISTORICO_TAMANHO:], arquivo, ensure_ascii=False, indent=2)
+        except OSError as err:
+            # Nunca derruba a execução por causa do histórico — é só uma
+            # otimização de diversidade, não uma etapa crítica.
+            print(f"⚠️ Não foi possível salvar '{self.arquivo_historico}' ({err}); seguindo sem ele.")
+
+    def _registrar_uso(self, caminho: str) -> None:
+        self._historico.append(caminho)
+        self._historico = self._historico[-MEDIA_HISTORICO_TAMANHO:]
+        self._salvar_historico()
+
+    # --- escolha ------------------------------------------------------------
+    def escolher_video(self) -> str:
+        """Escolhe aleatoriamente um vídeo de fundo, priorizando os que NÃO
+        estão no histórico recente (últimos MEDIA_HISTORICO_TAMANHO usados),
+        e só então valida de verdade (abre o arquivo, confere duração) o
+        candidato sorteado — nunca a biblioteca inteira. Se o candidato
+        falhar na validação, tenta o próximo, até MEDIA_MAX_TENTATIVAS.
+        """
+        candidatos = list(self.listar_videos())
+        if not candidatos:
+            raise RuntimeError(
+                f"❌ Nenhum vídeo encontrado em '{self.pasta_videos}' nem em "
+                f"'{VIDEO_FUNDO_PATH}'. Adicione arquivos de vídeo na "
+                f"biblioteca de mídia antes de rodar o bot."
+            )
+
+        random.shuffle(candidatos)
+        no_historico = set(self._historico)
+        ordem = sorted(candidatos, key=lambda item: item.caminho in no_historico)
+
+        tentativas = 0
+        for candidato in ordem:
+            if tentativas >= MEDIA_MAX_TENTATIVAS:
+                break
+            tentativas += 1
+            if self._validar_video(candidato.caminho):
+                self._registrar_uso(candidato.caminho)
+                return candidato.caminho
+            print(f"⚠️ Vídeo '{candidato.caminho}' não passou na validação; tentando outro.")
+
+        raise RuntimeError(
+            f"❌ Nenhum dos {tentativas} vídeo(s) testado(s) em '{self.pasta_videos}' "
+            f"passou na validação (duração mínima de {MEDIA_VIDEO_DURACAO_MINIMA}s, "
+            f"arquivo legível)."
+        )
+
+    def escolher_imagem(self) -> str:
+        """Mesma lógica de `escolher_video()`, para imagens — preparado
+        para uso futuro, ainda não consumido pelo pipeline de vídeo."""
+        candidatos = list(self.listar_imagens())
+        if not candidatos:
+            raise RuntimeError(f"❌ Nenhuma imagem encontrada em '{self.pasta_imagens}'.")
+
+        random.shuffle(candidatos)
+        no_historico = set(self._historico)
+        ordem = sorted(candidatos, key=lambda item: item.caminho in no_historico)
+
+        tentativas = 0
+        for candidato in ordem:
+            if tentativas >= MEDIA_MAX_TENTATIVAS:
+                break
+            tentativas += 1
+            if self._validar_imagem(candidato.caminho):
+                self._registrar_uso(candidato.caminho)
+                return candidato.caminho
+
+        raise RuntimeError(f"❌ Nenhuma imagem válida encontrada em '{self.pasta_imagens}'.")
+
+    def descartar(self, caminho: str) -> None:
+        """Remove um arquivo do pool desta execução (ex: passou na
+        validação leve/completa mas falhou de verdade durante a
+        renderização) — não re-escaneia o disco, só tira da lista já em
+        memória, para que a próxima escolha não bata nele de novo."""
+        if self._videos is not None:
+            self._videos = [item for item in self._videos if item.caminho != caminho]
+        if self._imagens is not None:
+            self._imagens = [item for item in self._imagens if item.caminho != caminho]
 
 
 # ===========================================================================
@@ -1432,7 +1699,7 @@ def montar_audio_final(
     return audio_final
 
 
-def _verificar_fundo_saudavel(clip: VideoFileClip, fracao_preta_maxima: float = 0.25) -> None:
+def _verificar_fundo_saudavel(clip: VideoFileClip, caminho: str, fracao_preta_maxima: float = 0.25) -> None:
     """Verifica se o vídeo de fundo já chega com uma região de preto sólido
     grande demais.
 
@@ -1462,14 +1729,14 @@ def _verificar_fundo_saudavel(clip: VideoFileClip, fracao_preta_maxima: float = 
     fracao_preta = max(piores_fracoes)
     if fracao_preta > fracao_preta_maxima:
         print(
-            f"⚠️ O vídeo de fundo '{VIDEO_FUNDO_PATH}' já contém uma região preta "
+            f"⚠️ O vídeo de fundo '{caminho}' já contém uma região preta "
             f"sólida grande (~{fracao_preta * 100:.0f}% da largura, medida em 3 "
             f"linhas do frame). Isso normalmente indica que o arquivo já foi "
             f"processado por outra ferramenta ANTES de chegar aqui (ex: um "
             f"conversor de proporção que adiciona barras pretas em vez de "
             f"cortar). Nosso pipeline vai recortar/dar zoom fielmente nesse "
             f"conteúdo, incluindo a parte preta — não é um bug de composição "
-            f"nosso. Recomendado: abra '{VIDEO_FUNDO_PATH}' direto num player "
+            f"nosso. Recomendado: abra '{caminho}' direto num player "
             f"para confirmar antes de publicar."
         )
 
@@ -1490,18 +1757,18 @@ def criar_video(
 
     try:
         if not os.path.exists(caminho_video_fundo):
-            raise FileNotFoundError(
+            raise FundoInvalidoError(
                 f"❌ Vídeo de fundo '{caminho_video_fundo}' não encontrado."
             )
         try:
             clip_video = VideoFileClip(caminho_video_fundo)
         except Exception as err:
-            raise RuntimeError(
+            raise FundoInvalidoError(
                 f"❌ Vídeo de fundo '{caminho_video_fundo}' corrompido ou ilegível: {err}"
             ) from err
         clips_para_fechar.append(clip_video)
         _debug_registrar("01_abertura", clip_video)
-        _verificar_fundo_saudavel(clip_video)
+        _verificar_fundo_saudavel(clip_video, caminho_video_fundo)
 
         clip_audio = AudioFileClip(caminho_audio)
         clips_para_fechar.append(clip_audio)
@@ -1668,6 +1935,37 @@ def criar_video(
                 pass  # nunca deixa um erro de limpeza mascarar o erro original
 
 
+def escolher_fundo_e_criar_video(roteiro: str, caminho_audio: str, media_manager: MediaManager) -> str:
+    """Ponte entre a biblioteca de mídia e `criar_video()`.
+
+    Antes, o caminho do fundo era sempre a constante `VIDEO_FUNDO_PATH`.
+    Agora é `media_manager.escolher_video()` — o resto do pipeline não muda
+    nada. Se o vídeo escolhido falhar durante a renderização de verdade
+    (`FundoInvalidoError`), descarta esse arquivo do pool desta execução e
+    tenta outro, até `MEDIA_MAX_TENTATIVAS` — nunca derruba o workflow por
+    causa de um único arquivo ruim que passou pela validação leve mas
+    falhou na hora de renderizar.
+    """
+    ultimo_erro: Optional[Exception] = None
+
+    for tentativa in range(1, MEDIA_MAX_TENTATIVAS + 1):
+        caminho_fundo = media_manager.escolher_video()
+        try:
+            return criar_video(roteiro, caminho_audio, caminho_fundo)
+        except FundoInvalidoError as err:
+            ultimo_erro = err
+            media_manager.descartar(caminho_fundo)
+            print(
+                f"⚠️ Fundo '{caminho_fundo}' falhou durante a renderização ({err}); "
+                f"descartado desta execução. Tentativa {tentativa}/{MEDIA_MAX_TENTATIVAS}."
+            )
+
+    raise RuntimeError(
+        f"❌ Nenhum vídeo de fundo funcionou após {MEDIA_MAX_TENTATIVAS} tentativas. "
+        f"Último erro: {ultimo_erro}"
+    )
+
+
 # ===========================================================================
 # 4. UPLOAD YOUTUBE (Descrição Otimizada)
 # ===========================================================================
@@ -1732,13 +2030,19 @@ def upload_youtube(caminho_video: str, titulo: str, roteiro: str) -> str:
 #   `pontos_de_corte` e os níveis de zoom em vez de usar `BLOCK_ZOOM_LEVELS`
 #   fixo.
 #
-# TODO (Banco de vídeos / Banco de músicas / Banco de efeitos sonoros /
-#   Banco de thumbnails): hoje `VIDEO_FUNDO_PATH` e `MUSICA_PATH` são
-#   caminhos fixos de um único arquivo. Um "banco" substituiria isso por uma
-#   fonte de múltiplos arquivos (pasta local, bucket, etc.) da qual o bot
-#   escolheria um item por execução. `add_sound_effect()` (seção 3.3) já
-#   existe como stub exatamente para o dia em que o banco de efeitos sonoros
-#   for implementado.
+# FEITO (Banco de vídeos): implementado na Fase 5 via `MediaManager` — ver
+#   seção 0. Escaneia `assets/videos/` (com subpastas por tema), valida
+#   levemente, escolhe evitando repetir os últimos usados
+#   (`media_history.json`), com fallback automático para o antigo
+#   `VIDEO_FUNDO_PATH` se a biblioteca estiver vazia.
+#
+# TODO (Banco de músicas / Banco de efeitos sonoros / Banco de
+#   thumbnails): mesmo princípio do `MediaManager`, ainda não aplicado a
+#   `MUSICA_PATH` nem a efeitos sonoros/thumbnails. `add_sound_effect()`
+#   (seção 3.3) já existe como stub exatamente para o dia em que o banco de
+#   efeitos sonoros for implementado. `MediaManager.listar_imagens()` /
+#   `escolher_imagem()` já existem e estão prontos para o banco de
+#   thumbnails, só ainda não são consumidos pelo pipeline.
 #
 # TODO (IA escolhendo música / fundo / efeitos / thumbnail / voz): uma vez
 #   que os "bancos" acima existam, a escolha entre os itens de cada banco
@@ -1827,9 +2131,12 @@ def main() -> None:
     tempos: Dict[str, float] = {}
 
     try:
+        media_manager = MediaManager()
         titulo, roteiro = _rodar_etapa("🧠 Gemini", tempos, gerar_roteiro)
         audio_path = _rodar_etapa("🎙 ElevenLabs", tempos, gerar_audio, roteiro)
-        video_path = _rodar_etapa("🎬 Render", tempos, criar_video, roteiro, audio_path, VIDEO_FUNDO_PATH)
+        video_path = _rodar_etapa(
+            "🎬 Render", tempos, escolher_fundo_e_criar_video, roteiro, audio_path, media_manager
+        )
         _rodar_etapa("🚀 Upload", tempos, upload_youtube, video_path, titulo, roteiro)
 
     except Exception as err:
