@@ -10,6 +10,13 @@ Este arquivo mantém a mesma arquitetura do projeto original (tudo em um
 único arquivo). A única dependência nova é `faster-whisper`, necessária
 para a sincronização de legendas por palavra — ver justificativa técnica
 na seção de transcrição, mais abaixo.
+
+Fase 6: a biblioteca de mídia (seção 0) ganhou uma camada `MediaProvider`
+(`LocalMediaProvider` / `PexelsMediaProvider`) por trás do `MediaManager`,
+permitindo buscar vídeos de fundo automaticamente no Pexels quando
+`PEXELS_API_KEY` está configurada, com fallback automático e transparente
+para a biblioteca local se o Pexels falhar. Nenhuma dependência nova foi
+adicionada (usa `urllib` da stdlib).
 """
 
 import os
@@ -106,6 +113,7 @@ CACHE_DIR: str = "cache/pexels"
 CACHE_METADATA_PATH: str = "cache/pexels/metadata.json"
 CACHE_TTL_HOURS: float = 24.0  # depois disso, o cache expira e pode baixar de novo
 MAX_PALAVRAS_CHAVE_PESQUISA: int = 4  # quantas palavras-chave extrair do roteiro
+PEXELS_MIN_PALAVRA_LEN: int = 4  # ignora palavras menores que isso na extração de palavras-chave
 
 # --- Identidade visual (cor de destaque compartilhada) ---
 # Uma ÚNICA cor de destaque usada tanto nas legendas quanto na barra de
@@ -216,12 +224,45 @@ PALAVRAS_CHAVE = {
     "recorde", "ano", "anos",
 }
 
+# Palavras ignoradas na extração de palavras-chave de busca do
+# PexelsMediaProvider (seção 0): além dos artigos/preposições de
+# PALAVRAS_INSEPARAVEIS, inclui verbos auxiliares, pronomes e conectivos
+# comuns que não ajudam a descrever visualmente o roteiro. Comparação
+# sempre feita com a palavra já normalizada (sem acento, minúscula).
+STOPWORDS_PESQUISA = PALAVRAS_INSEPARAVEIS | {
+    "que", "para", "mas", "por", "sao", "foi", "ser", "estar", "esta",
+    "este", "essa", "esse", "isso", "aquilo", "aquele", "aquela",
+    "ele", "ela", "eles", "elas", "voce", "nao", "sim", "quando", "onde",
+    "como", "porque", "porem", "tambem", "ja", "ainda", "so", "apenas",
+    "cada", "todo", "toda", "todos", "todas", "outro", "outra", "outros",
+    "outras", "seu", "sua", "seus", "suas", "meu", "minha", "meus",
+    "minhas", "tem", "tinha", "vai", "vou", "pode", "podem", "havia",
+    "houve", "muito", "muita", "muitos", "muitas", "mais", "menos",
+    "entre", "sobre", "apos", "antes", "depois", "assim", "entao",
+    "qual", "quais", "quem", "isto", "estes", "estas", "aqueles",
+    "aquelas", "haver", "fazer", "fez", "fazem",
+}
+
 
 
 
 # ===========================================================================
-# 0. BIBLIOTECA DE MÍDIA (MediaManager)
+# 0. BIBLIOTECA DE MÍDIA (MediaProvider + MediaManager)
 # ===========================================================================
+# Arquitetura (Fase 6):
+#
+#   MediaManager
+#         │  (nunca toca disco nem API diretamente)
+#         ▼
+#   MediaProvider  (interface)
+#         │
+#         ├──── LocalMediaProvider   (Fase 5 — migrado sem mudança de comportamento)
+#         └──── PexelsMediaProvider  (Fase 6 — novo)
+#
+# O MediaManager decide COMO escolher (histórico, evitar repetição,
+# fallback entre providers). Cada MediaProvider decide APENAS de onde a
+# mídia vem e como validá-la/descartá-la. Nenhum dos dois sabe nada sobre
+# Ken Burns, legendas, roteiro etc.
 class FundoInvalidoError(RuntimeError):
     """Erro específico para quando o vídeo de fundo está ausente, vazio ou
     corrompido. Separado de RuntimeError genérico de propósito: permite que
@@ -230,57 +271,100 @@ class FundoInvalidoError(RuntimeError):
     da mensagem de erro."""
 
 
-# Responsabilidade única: gerenciar a pasta local de vídeos/imagens de
-# fundo. NÃO baixa nada, NÃO usa IA, NÃO faz nenhuma análise pesada de
-# conteúdo (sem OpenCV, sem modelos) — só olha extensão de arquivo, tamanho
-# em bytes e (apenas no candidato efetivamente escolhido) a duração real do
-# vídeo. Isso é o suficiente para "validar" no sentido pedido (ignorar
-# arquivo vazio/corrompido/curto demais) sem pesar no tempo de execução.
 @dataclass
 class MediaItem:
-    """Um item da biblioteca de mídia: caminho, subpasta de origem
-    (usada só como categoria informativa, não para nenhuma lógica de
-    IA/tema) e tipo ("video" ou "imagem")."""
+    """Um item de mídia: caminho local (já baixado, se for remoto),
+    categoria (informativa — pasta de origem local, ou "pexels/<palavra>"
+    para itens remotos) e tipo ("video" ou "imagem")."""
     caminho: str
     categoria: str
     tipo: str
 
 
-class MediaManager:
-    """Escolhe automaticamente um vídeo (ou imagem, já preparado para o
-    futuro) de fundo a partir de uma biblioteca local de arquivos.
+class MediaProvider(ABC):
+    """Contrato único que qualquer fonte de mídia deve implementar (Local,
+    Pexels, Pixabay, ...). Responsabilidade única: fornecer mídia — listar
+    candidatos e validar/descartar o candidato escolhido. Nada mais: não
+    decide QUAL escolher, não guarda histórico de uso entre execuções, não
+    sabe nada do resto do pipeline. Isso é trabalho do `MediaManager`.
+    """
 
-    Único responsável por: listar vídeos/imagens, validar arquivos (de
-    forma leve), escolher aleatoriamente evitando repetir os últimos
-    usados, e devolver o caminho escolhido. Nada além disso — não edita
-    vídeo, não decide efeito, não sabe nada sobre Ken Burns/legendas.
+    @abstractmethod
+    def listar_videos(self, contexto: Optional[str] = None) -> List[MediaItem]:
+        """Retorna candidatos a vídeo de fundo, já prontos para uso (ex.:
+        já baixados e em disco, no caso de um provider remoto).
 
-    Escaneia cada pasta apenas uma vez por execução (resultado cacheado em
-    memória em `self._videos`/`self._imagens`); chamadas repetidas a
-    `listar_videos()` não tocam o disco de novo.
+        `contexto` é opcional: providers que precisam de mais informação
+        para buscar mídia relevante (ex.: o roteiro do vídeo, usado pelo
+        PexelsMediaProvider para gerar palavras-chave de busca) o recebem
+        aqui. Providers que não precisam (ex.: Local) simplesmente o
+        ignoram — a assinatura é a mesma para todos.
+        """
+
+    @abstractmethod
+    def validar_video(self, item: MediaItem) -> bool:
+        """Validação completa (cara: abre o arquivo de verdade) do
+        candidato JÁ escolhido pelo MediaManager — nunca é chamada em toda
+        a lista de candidatos, só no vencedor do sorteio."""
+
+    def descartar(self, item: MediaItem) -> None:
+        """Hook opcional: o provider pode reagir a um descarte (ex.: um
+        candidato passou na validação leve mas falhou de verdade durante a
+        renderização). Default: nada a fazer — sobrescrito só por quem
+        precisa (ex.: PexelsMediaProvider invalida o cache do item)."""
+        return None
+
+
+def _validar_arquivo_video(caminho: str) -> bool:
+    """Validação completa de um arquivo de vídeo, compartilhada por todos
+    os MediaProviders: consegue abrir e tem pelo menos
+    MEDIA_VIDEO_DURACAO_MINIMA segundos. Extraída como função solta (em
+    vez de método duplicado em cada provider) porque a lógica é idêntica
+    independente de o arquivo ter vindo do disco local ou de um download
+    do Pexels — só muda de onde o arquivo chegou até aqui."""
+    clip = None
+    try:
+        clip = VideoFileClip(caminho)
+        return bool(clip.duration and clip.duration >= MEDIA_VIDEO_DURACAO_MINIMA)
+    except Exception:
+        return False
+    finally:
+        if clip is not None:
+            clip.close()
+
+
+class LocalMediaProvider(MediaProvider):
+    """Fonte de mídia local: escaneia `assets/videos/` (com subpastas por
+    tema) e `assets/imagens/`, e serve os arquivos encontrados. Migrado
+    sem mudança de comportamento a partir do `MediaManager` da Fase 5 —
+    toda a lógica de disco do projeto (antes espalhada dentro dele) agora
+    mora aqui. É o único provider que sabe o que é um `os.walk`.
+
+    Ignora `contexto` por completo: a busca é sempre "a biblioteca local
+    inteira", não depende do roteiro.
+
+    Escaneia cada pasta apenas uma vez por execução (cache em memória em
+    `self._videos`/`self._imagens`); chamadas repetidas não tocam o disco
+    de novo.
     """
 
     def __init__(
         self,
         pasta_videos: str = MEDIA_VIDEOS_DIR,
         pasta_imagens: str = MEDIA_IMAGENS_DIR,
-        arquivo_historico: str = MEDIA_HISTORICO_PATH,
     ) -> None:
         self.pasta_videos = pasta_videos
         self.pasta_imagens = pasta_imagens
-        self.arquivo_historico = arquivo_historico
-        self._videos: Optional[List[MediaItem]] = None  # cache: só escaneia na 1ª chamada
+        self._videos: Optional[List[MediaItem]] = None
         self._imagens: Optional[List[MediaItem]] = None
-        self._historico: List[str] = self._carregar_historico()
 
     # --- listagem (com cache em memória) --------------------------------
-    def listar_videos(self) -> List[MediaItem]:
-        """Lista os vídeos válidos da biblioteca (escaneia o disco só na
-        primeira chamada). Se a biblioteca estiver vazia, cai de volta para
-        o único arquivo legado `VIDEO_FUNDO_PATH`, se ele existir — assim
-        um projeto que ainda não montou a pasta `assets/videos/` continua
-        funcionando exatamente como antes, sem nenhuma configuração extra.
-        """
+    def listar_videos(self, contexto: Optional[str] = None) -> List[MediaItem]:
+        """Lista os vídeos válidos da biblioteca local. Se ela estiver
+        vazia, cai de volta para o único arquivo legado `VIDEO_FUNDO_PATH`,
+        se ele existir — um projeto que ainda não montou `assets/videos/`
+        continua funcionando exatamente como antes, sem configuração
+        extra."""
         if self._videos is not None:
             return self._videos
 
@@ -288,7 +372,7 @@ class MediaManager:
 
         if not videos and os.path.exists(VIDEO_FUNDO_PATH) and self._validacao_leve(VIDEO_FUNDO_PATH):
             print(
-                f"ℹ️ Biblioteca de mídia vazia em '{self.pasta_videos}'; "
+                f"ℹ️ Biblioteca de mídia local vazia em '{self.pasta_videos}'; "
                 f"usando o arquivo legado '{VIDEO_FUNDO_PATH}'."
             )
             videos = [MediaItem(caminho=VIDEO_FUNDO_PATH, categoria="legado", tipo="video")]
@@ -297,9 +381,11 @@ class MediaManager:
         return self._videos
 
     def listar_imagens(self) -> List[MediaItem]:
-        """Lista as imagens válidas da biblioteca (escaneia só uma vez).
-        Preparado para uso futuro — nada no pipeline atual consome imagens
-        como fundo ainda."""
+        """Lista as imagens válidas da biblioteca local (escaneia só uma
+        vez). Preparado para uso futuro — nada no pipeline atual consome
+        imagens como fundo ainda. Não faz parte da interface
+        `MediaProvider` (nenhum outro provider serve imagens ainda), então
+        fica como método extra só do Local."""
         if self._imagens is None:
             self._imagens = self._escanear(self.pasta_imagens, MEDIA_EXTENSOES_IMAGEM, "imagem")
         return self._imagens
@@ -332,31 +418,309 @@ class MediaManager:
         except OSError:
             return False
 
-    def _validar_video(self, caminho: str) -> bool:
-        """Validação completa — só é chamada no candidato JÁ SORTEADO, nunca
-        na biblioteca inteira: consegue abrir e tem pelo menos
-        MEDIA_VIDEO_DURACAO_MINIMA segundos."""
-        clip = None
-        try:
-            clip = VideoFileClip(caminho)
-            return bool(clip.duration and clip.duration >= MEDIA_VIDEO_DURACAO_MINIMA)
-        except Exception:
-            return False
-        finally:
-            if clip is not None:
-                clip.close()
+    def validar_video(self, item: MediaItem) -> bool:
+        return _validar_arquivo_video(item.caminho)
 
-    def _validar_imagem(self, caminho: str) -> bool:
+    def validar_imagem(self, item: MediaItem) -> bool:
         """Validação completa de imagem — mesmo princípio: só é chamada no
         candidato sorteado, usando PIL (já é dependência do projeto)."""
         try:
-            with Image.open(caminho) as img:
+            with Image.open(item.caminho) as img:
                 img.verify()
             return True
         except Exception:
             return False
 
-    # --- histórico / diversidade ------------------------------------------
+
+class PexelsMediaProvider(MediaProvider):
+    """Provider remoto: busca, baixa e cacheia vídeos do banco Pexels a
+    partir de palavras-chave extraídas do roteiro. Usa SOMENTE a API
+    oficial (`PEXELS_API_URL`) via `urllib` (stdlib) — sem scraping, sem
+    Selenium, sem Playwright, sem navegador, sem dependência nova.
+
+    Responsabilidade única: entregar `MediaItem`s de vídeos já baixados e
+    prontos para uso. Cache, expiração (`CACHE_TTL_HOURS`) e limite de
+    downloads por execução (`PEXELS_MAX_DOWNLOADS`) ficam inteiramente
+    aqui dentro — o resto do projeto não sabe (nem precisa saber) que os
+    arquivos vieram da internet.
+
+    A API Key NUNCA fica no código: só é aceita via parâmetro no
+    construtor, e quem monta o provider (`_criar_media_manager()`, mais
+    abaixo) só a lê de `os.environ[PEXELS_API_KEY_ENV_VAR]`.
+    """
+
+    def __init__(
+        self,
+        api_key: str,
+        cache_dir: str = CACHE_DIR,
+        metadata_path: str = CACHE_METADATA_PATH,
+    ) -> None:
+        self.api_key = api_key
+        self.cache_dir = cache_dir
+        self.metadata_path = metadata_path
+        os.makedirs(self.cache_dir, exist_ok=True)
+        self._metadata: Dict[str, dict] = self._carregar_metadata()
+
+    # --- cache / metadata ---------------------------------------------------
+    def _carregar_metadata(self) -> Dict[str, dict]:
+        if not os.path.exists(self.metadata_path):
+            return {}
+        try:
+            with open(self.metadata_path, "r", encoding="utf-8") as arquivo:
+                dados = json.load(arquivo)
+            return dados if isinstance(dados, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def _salvar_metadata(self) -> None:
+        try:
+            os.makedirs(os.path.dirname(self.metadata_path) or ".", exist_ok=True)
+            with open(self.metadata_path, "w", encoding="utf-8") as arquivo:
+                json.dump(self._metadata, arquivo, ensure_ascii=False, indent=2)
+        except OSError as err:
+            # Nunca derruba a execução por causa do cache — é só uma
+            # otimização de banda/quota, não uma etapa crítica.
+            print(f"⚠️ Pexels: não foi possível salvar cache ({err}); seguindo sem persistir.")
+
+    def _cache_valido(self, entrada: dict) -> bool:
+        caminho = entrada.get("caminho")
+        baixado_em = entrada.get("baixado_em", 0)
+        if not caminho or not os.path.exists(caminho):
+            return False
+        idade_horas = (time.time() - baixado_em) / 3600
+        return idade_horas < CACHE_TTL_HOURS
+
+    def _videos_em_cache_validos(self) -> List[MediaItem]:
+        """Retorna os itens de cache ainda válidos e, de quebra, expurga do
+        metadata (em memória) as entradas expiradas ou com arquivo
+        ausente — a remoção efetiva do arquivo em disco fica a cargo de
+        `limpar_cache_expirado()`, chamado ao final da execução."""
+        validos: List[MediaItem] = []
+        for video_id, entrada in list(self._metadata.items()):
+            if self._cache_valido(entrada):
+                validos.append(
+                    MediaItem(caminho=entrada["caminho"], categoria="pexels/cache", tipo="video")
+                )
+        return validos
+
+    # --- palavras-chave -------------------------------------------------
+    def _extrair_palavras_chave(self, roteiro: str) -> List[str]:
+        """Extrai até MAX_PALAVRAS_CHAVE_PESQUISA palavras-chave do
+        roteiro por frequência simples, ignorando STOPWORDS_PESQUISA e
+        palavras curtas demais. Deliberadamente NÃO usa IA/embeddings para
+        isso (fora de escopo desta fase) — é uma heurística leve, sem
+        dependência nova, que já é suficiente para gerar termos de busca
+        razoáveis a partir de um roteiro em português."""
+        contagem: Dict[str, int] = {}
+        for palavra in re.findall(r"[A-Za-zÀ-ÿ]+", roteiro):
+            normalizada = _normalizar_palavra(palavra)
+            if len(normalizada) < PEXELS_MIN_PALAVRA_LEN or normalizada in STOPWORDS_PESQUISA:
+                continue
+            contagem[normalizada] = contagem.get(normalizada, 0) + 1
+
+        ordenadas = sorted(contagem.items(), key=lambda par: (-par[1], par[0]))
+        palavras = [palavra for palavra, _freq in ordenadas[:MAX_PALAVRAS_CHAVE_PESQUISA]]
+        return palavras or ["nature"]  # fallback genérico se o roteiro não render nenhum termo válido
+
+    # --- busca / download ---------------------------------------------------
+    def _buscar(self, query: str) -> List[dict]:
+        """Consulta a API oficial do Pexels. Erros de rede/HTTP viram
+        RuntimeError com prefixo "❌ Pexels: ..." — capturados por
+        `listar_videos()`, que segue para a próxima palavra-chave em vez
+        de interromper a busca inteira por causa de uma falha pontual."""
+        parametros = urllib.parse.urlencode(
+            {"query": query, "per_page": PEXELS_MAX_RESULTS, "orientation": PEXELS_ORIENTACAO}
+        )
+        url = f"{PEXELS_API_URL}?{parametros}"
+        requisicao = urllib.request.Request(url, headers={"Authorization": self.api_key})
+        try:
+            with urllib.request.urlopen(requisicao, timeout=PEXELS_TIMEOUT_SECONDS) as resposta:
+                dados = json.loads(resposta.read().decode("utf-8"))
+            return dados.get("videos", [])
+        except urllib.error.HTTPError as err:
+            if err.code == 401:
+                raise RuntimeError("❌ Pexels: API Key inválida (HTTP 401).") from err
+            raise RuntimeError(f"❌ Pexels: busca por '{query}' falhou (HTTP {err.code}).") from err
+        except (urllib.error.URLError, socket.timeout) as err:
+            raise RuntimeError(f"❌ Pexels: indisponível/timeout na busca por '{query}' ({err}).") from err
+
+    def _escolher_arquivo(self, video: dict) -> Optional[dict]:
+        """Entre os `video_files` de um resultado do Pexels, escolhe o que
+        melhor atende resolução mínima (MIN_WIDTH), priorizando fps e
+        largura preferidos (PEXELS_FPS_PREFERIDO / PEXELS_RESOLUCAO_PREFERIDA).
+        Ignora automaticamente qualquer arquivo com largura insuficiente."""
+        candidatos = [
+            arquivo
+            for arquivo in video.get("video_files", [])
+            if arquivo.get("width") and arquivo["width"] >= MIN_WIDTH
+        ]
+        if not candidatos:
+            return None
+
+        def pontuacao(arquivo: dict) -> Tuple[bool, bool, int]:
+            return (
+                arquivo.get("fps") == PEXELS_FPS_PREFERIDO,
+                arquivo.get("width") == PEXELS_RESOLUCAO_PREFERIDA[0],
+                arquivo.get("width", 0),
+            )
+
+        return max(candidatos, key=pontuacao)
+
+    def _baixar_arquivo(self, url: str, destino: str) -> bool:
+        """Baixa para um arquivo temporário `.part` e só promove para o
+        destino final (`os.replace`, atômico) se o download terminar sem
+        erro e com conteúdo não vazio — protege contra downloads
+        interrompidos deixarem um `.mp4` corrompido no cache."""
+        temporario = destino + ".part"
+        try:
+            requisicao = urllib.request.Request(url)
+            with urllib.request.urlopen(requisicao, timeout=PEXELS_TIMEOUT_SECONDS) as resposta:
+                with open(temporario, "wb") as arquivo_saida:
+                    arquivo_saida.write(resposta.read())
+        except (urllib.error.URLError, urllib.error.HTTPError, socket.timeout, OSError) as err:
+            print(f"⚠️ Pexels: falha ao baixar '{url}' ({err}).")
+            if os.path.exists(temporario):
+                os.remove(temporario)
+            return False
+
+        if os.path.getsize(temporario) == 0:
+            os.remove(temporario)
+            return False
+
+        os.replace(temporario, destino)
+        return True
+
+    # --- interface MediaProvider -----------------------------------------
+    def listar_videos(self, contexto: Optional[str] = None) -> List[MediaItem]:
+        """Fluxo: reaproveita cache válido primeiro (evita gastar
+        quota/banda à toa); só busca/baixa mais se ainda faltar para
+        `PEXELS_MIN_DOWNLOADS_DESEJADOS`. `contexto` é o roteiro — sem ele
+        não há como gerar palavras-chave, então devolve só o que já está
+        em cache (podendo ser uma lista vazia, o que faz o MediaManager
+        cair para o fallback local)."""
+        em_cache = self._videos_em_cache_validos()
+        if len(em_cache) >= PEXELS_MIN_DOWNLOADS_DESEJADOS:
+            return em_cache
+
+        if not contexto:
+            return em_cache
+
+        palavras_chave = self._extrair_palavras_chave(contexto)
+        novos: List[MediaItem] = []
+
+        for palavra in palavras_chave:
+            if len(em_cache) + len(novos) >= PEXELS_MAX_DOWNLOADS:
+                break
+            try:
+                resultados = self._buscar(palavra)
+            except RuntimeError as err:
+                print(f"⚠️ {err}")
+                continue
+
+            for video in resultados:
+                if len(em_cache) + len(novos) >= PEXELS_MAX_DOWNLOADS:
+                    break
+
+                duracao = video.get("duration", 0)
+                if duracao < MEDIA_VIDEO_DURACAO_MINIMA:
+                    continue  # ignora vídeos menores que a duração mínima
+
+                video_id = str(video.get("id"))
+                if video_id in self._metadata and self._cache_valido(self._metadata[video_id]):
+                    continue  # já temos esse vídeo específico em cache
+
+                arquivo = self._escolher_arquivo(video)
+                if arquivo is None:
+                    continue  # nenhum arquivo com resolução suficiente
+
+                destino = os.path.join(self.cache_dir, f"{video_id}.mp4")
+                if not self._baixar_arquivo(arquivo["link"], destino):
+                    continue  # download quebrado/interrompido — já tratado e logado
+
+                self._metadata[video_id] = {
+                    "caminho": destino,
+                    "baixado_em": time.time(),
+                    "palavra_chave": palavra,
+                }
+                novos.append(MediaItem(caminho=destino, categoria=f"pexels/{palavra}", tipo="video"))
+
+        if novos:
+            self._salvar_metadata()
+
+        return em_cache + novos
+
+    def validar_video(self, item: MediaItem) -> bool:
+        return _validar_arquivo_video(item.caminho)
+
+    def descartar(self, item: MediaItem) -> None:
+        """Remove do metadata (não do disco — isso é papel de
+        `limpar_cache_expirado()`) qualquer entrada apontando para este
+        arquivo, para que não seja reoferecido nem nesta execução nem na
+        próxima (força nova busca/download)."""
+        alterado = False
+        for video_id, entrada in list(self._metadata.items()):
+            if entrada.get("caminho") == item.caminho:
+                self._metadata.pop(video_id, None)
+                alterado = True
+        if alterado:
+            self._salvar_metadata()
+
+    # --- limpeza (pensada para o runner efêmero do GitHub Actions) --------
+    def limpar_cache_expirado(self) -> None:
+        """Remove do disco (e do metadata) qualquer arquivo cujo cache já
+        expirou (> CACHE_TTL_HOURS) e qualquer `.part` órfão de downloads
+        interrompidos. Chamado ao final da execução (`main()`) para não
+        acumular espaço em disco entre execuções do runner."""
+        for video_id, entrada in list(self._metadata.items()):
+            if not self._cache_valido(entrada):
+                caminho = entrada.get("caminho")
+                if caminho and os.path.exists(caminho):
+                    try:
+                        os.remove(caminho)
+                    except OSError:
+                        pass
+                self._metadata.pop(video_id, None)
+
+        if os.path.isdir(self.cache_dir):
+            for nome in os.listdir(self.cache_dir):
+                if nome.endswith(".part"):
+                    try:
+                        os.remove(os.path.join(self.cache_dir, nome))
+                    except OSError:
+                        pass
+
+        self._salvar_metadata()
+
+
+class MediaManager:
+    """Escolhe automaticamente um vídeo de fundo, decidindo QUAL provider
+    consultar e mantendo o histórico de uso entre execuções (para evitar
+    repetir os últimos usados). Não conversa com disco nem com APIs
+    diretamente — só com um `MediaProvider`.
+
+    Recebe um provider primário e, opcionalmente, um provider de fallback.
+    Se o primário falhar (lista vazia, exceção, validação de todos os
+    candidatos falhando — ex.: Pexels indisponível), cai automaticamente
+    para o fallback sem interromper o workflow (ver `escolher_video()`).
+    O usuário final nunca percebe a troca — só um aviso no log.
+    """
+
+    def __init__(
+        self,
+        provider: Optional[MediaProvider] = None,
+        provider_fallback: Optional[MediaProvider] = None,
+        arquivo_historico: str = MEDIA_HISTORICO_PATH,
+    ) -> None:
+        self.provider = provider or LocalMediaProvider()
+        self.provider_fallback = provider_fallback
+        self.arquivo_historico = arquivo_historico
+        self._historico: List[str] = self._carregar_historico()
+        # Lembra de qual provider cada arquivo veio, para que `descartar()`
+        # chame o `.descartar()` do provider certo (ex.: invalidar cache do
+        # Pexels), sem o chamador precisar saber a origem.
+        self._origem: Dict[str, MediaProvider] = {}
+
+    # --- histórico / diversidade (inalterado desde a Fase 5) --------------
     def _carregar_historico(self) -> List[str]:
         if not os.path.exists(self.arquivo_historico):
             return []
@@ -374,8 +738,6 @@ class MediaManager:
             with open(self.arquivo_historico, "w", encoding="utf-8") as arquivo:
                 json.dump(self._historico[-MEDIA_HISTORICO_TAMANHO:], arquivo, ensure_ascii=False, indent=2)
         except OSError as err:
-            # Nunca derruba a execução por causa do histórico — é só uma
-            # otimização de diversidade, não uma etapa crítica.
             print(f"⚠️ Não foi possível salvar '{self.arquivo_historico}' ({err}); seguindo sem ele.")
 
     def _registrar_uso(self, caminho: str) -> None:
@@ -384,20 +746,28 @@ class MediaManager:
         self._salvar_historico()
 
     # --- escolha ------------------------------------------------------------
-    def escolher_video(self) -> str:
-        """Escolhe aleatoriamente um vídeo de fundo, priorizando os que NÃO
-        estão no histórico recente (últimos MEDIA_HISTORICO_TAMANHO usados),
-        e só então valida de verdade (abre o arquivo, confere duração) o
-        candidato sorteado — nunca a biblioteca inteira. Se o candidato
-        falhar na validação, tenta o próximo, até MEDIA_MAX_TENTATIVAS.
-        """
-        candidatos = list(self.listar_videos())
-        if not candidatos:
-            raise RuntimeError(
-                f"❌ Nenhum vídeo encontrado em '{self.pasta_videos}' nem em "
-                f"'{VIDEO_FUNDO_PATH}'. Adicione arquivos de vídeo na "
-                f"biblioteca de mídia antes de rodar o bot."
+    def escolher_video(self, contexto: Optional[str] = None) -> str:
+        """Escolhe um vídeo de fundo via o provider primário; se ele
+        falhar por qualquer motivo (indisponibilidade, API Key inválida,
+        timeout, nenhum candidato válido...), cai para o provider de
+        fallback (tipicamente `LocalMediaProvider`) sem propagar o erro —
+        só loga um aviso. Se não houver fallback (ou o fallback for o
+        próprio primário), o erro sobe normalmente."""
+        try:
+            return self._escolher_de(self.provider, contexto)
+        except Exception as err:
+            if self.provider_fallback is None or self.provider_fallback is self.provider:
+                raise
+            print(
+                f"⚠️ Provedor de mídia primário ({type(self.provider).__name__}) falhou "
+                f"({err}); usando {type(self.provider_fallback).__name__} como fallback."
             )
+            return self._escolher_de(self.provider_fallback, contexto)
+
+    def _escolher_de(self, provider: MediaProvider, contexto: Optional[str]) -> str:
+        candidatos = list(provider.listar_videos(contexto))
+        if not candidatos:
+            raise RuntimeError(f"{type(provider).__name__} não retornou nenhum vídeo candidato.")
 
         random.shuffle(candidatos)
         no_historico = set(self._historico)
@@ -408,23 +778,25 @@ class MediaManager:
             if tentativas >= MEDIA_MAX_TENTATIVAS:
                 break
             tentativas += 1
-            if self._validar_video(candidato.caminho):
+            if provider.validar_video(candidato):
+                self._origem[candidato.caminho] = provider
                 self._registrar_uso(candidato.caminho)
                 return candidato.caminho
             print(f"⚠️ Vídeo '{candidato.caminho}' não passou na validação; tentando outro.")
 
         raise RuntimeError(
-            f"❌ Nenhum dos {tentativas} vídeo(s) testado(s) em '{self.pasta_videos}' "
-            f"passou na validação (duração mínima de {MEDIA_VIDEO_DURACAO_MINIMA}s, "
-            f"arquivo legível)."
+            f"Nenhum dos {tentativas} vídeo(s) testado(s) via {type(provider).__name__} "
+            f"passou na validação."
         )
 
     def escolher_imagem(self) -> str:
-        """Mesma lógica de `escolher_video()`, para imagens — preparado
-        para uso futuro, ainda não consumido pelo pipeline de vídeo."""
-        candidatos = list(self.listar_imagens())
+        """Preparado para uso futuro — ainda não consumido pelo pipeline
+        de vídeo. Só o `LocalMediaProvider` serve imagens por enquanto
+        (Pexels desta fase é só de vídeo)."""
+        provider = self.provider if isinstance(self.provider, LocalMediaProvider) else LocalMediaProvider()
+        candidatos = list(provider.listar_imagens())
         if not candidatos:
-            raise RuntimeError(f"❌ Nenhuma imagem encontrada em '{self.pasta_imagens}'.")
+            raise RuntimeError(f"❌ Nenhuma imagem encontrada em '{provider.pasta_imagens}'.")
 
         random.shuffle(candidatos)
         no_historico = set(self._historico)
@@ -435,21 +807,56 @@ class MediaManager:
             if tentativas >= MEDIA_MAX_TENTATIVAS:
                 break
             tentativas += 1
-            if self._validar_imagem(candidato.caminho):
+            if provider.validar_imagem(candidato):
                 self._registrar_uso(candidato.caminho)
                 return candidato.caminho
 
-        raise RuntimeError(f"❌ Nenhuma imagem válida encontrada em '{self.pasta_imagens}'.")
+        raise RuntimeError(f"❌ Nenhuma imagem válida encontrada em '{provider.pasta_imagens}'.")
 
     def descartar(self, caminho: str) -> None:
         """Remove um arquivo do pool desta execução (ex: passou na
         validação leve/completa mas falhou de verdade durante a
-        renderização) — não re-escaneia o disco, só tira da lista já em
-        memória, para que a próxima escolha não bata nele de novo."""
-        if self._videos is not None:
-            self._videos = [item for item in self._videos if item.caminho != caminho]
-        if self._imagens is not None:
-            self._imagens = [item for item in self._imagens if item.caminho != caminho]
+        renderização) — delega ao provider de origem (para que ele possa,
+        por exemplo, invalidar o cache) e tira das listas locais dos
+        providers `LocalMediaProvider` envolvidos, para não bater no mesmo
+        arquivo de novo nesta execução."""
+        provider_origem = self._origem.get(caminho, self.provider)
+        provider_origem.descartar(MediaItem(caminho=caminho, categoria="", tipo="video"))
+
+        for provider in {self.provider, self.provider_fallback}:
+            if isinstance(provider, LocalMediaProvider) and provider._videos is not None:
+                provider._videos = [item for item in provider._videos if item.caminho != caminho]
+
+    def limpar_cache_temporario(self) -> None:
+        """Chamado ao final da execução (ver `main()`): dá a chance de
+        cada provider liberar espaço em disco (cache expirado, downloads
+        `.part` interrompidos) — pensado para o runner efêmero do GitHub
+        Actions, que não deve acumular espaço entre execuções. Providers
+        sem necessidade disso (ex.: Local) simplesmente não implementam
+        `limpar_cache_expirado()` e são ignorados aqui."""
+        for provider in {self.provider, self.provider_fallback}:
+            limpar = getattr(provider, "limpar_cache_expirado", None)
+            if callable(limpar):
+                try:
+                    limpar()
+                except Exception as err:
+                    print(f"⚠️ Falha ao limpar cache de {type(provider).__name__} ({err}).")
+
+
+def _criar_media_manager() -> MediaManager:
+    """Decide, a partir do ambiente, quais providers usar: se
+    `PEXELS_API_KEY_ENV_VAR` estiver definida, Pexels é o primário e Local
+    o fallback automático; caso contrário, só Local (comportamento
+    idêntico ao da Fase 5). Centraliza essa decisão aqui para que `main()`
+    não precise saber nada sobre providers."""
+    api_key = os.environ.get(PEXELS_API_KEY_ENV_VAR)
+    if not api_key:
+        return MediaManager(provider=LocalMediaProvider())
+
+    return MediaManager(
+        provider=PexelsMediaProvider(api_key=api_key),
+        provider_fallback=LocalMediaProvider(),
+    )
 
 
 # ===========================================================================
@@ -1939,17 +2346,19 @@ def escolher_fundo_e_criar_video(roteiro: str, caminho_audio: str, media_manager
     """Ponte entre a biblioteca de mídia e `criar_video()`.
 
     Antes, o caminho do fundo era sempre a constante `VIDEO_FUNDO_PATH`.
-    Agora é `media_manager.escolher_video()` — o resto do pipeline não muda
-    nada. Se o vídeo escolhido falhar durante a renderização de verdade
-    (`FundoInvalidoError`), descarta esse arquivo do pool desta execução e
-    tenta outro, até `MEDIA_MAX_TENTATIVAS` — nunca derruba o workflow por
-    causa de um único arquivo ruim que passou pela validação leve mas
-    falhou na hora de renderizar.
+    Agora é `media_manager.escolher_video(contexto=roteiro)` — o roteiro é
+    passado como contexto para que um provider remoto (Pexels) possa gerar
+    palavras-chave de busca a partir dele; providers locais o ignoram. O
+    resto do pipeline não muda nada. Se o vídeo escolhido falhar durante a
+    renderização de verdade (`FundoInvalidoError`), descarta esse arquivo
+    do pool desta execução e tenta outro, até `MEDIA_MAX_TENTATIVAS` —
+    nunca derruba o workflow por causa de um único arquivo ruim que passou
+    pela validação leve mas falhou na hora de renderizar.
     """
     ultimo_erro: Optional[Exception] = None
 
     for tentativa in range(1, MEDIA_MAX_TENTATIVAS + 1):
-        caminho_fundo = media_manager.escolher_video()
+        caminho_fundo = media_manager.escolher_video(contexto=roteiro)
         try:
             return criar_video(roteiro, caminho_audio, caminho_fundo)
         except FundoInvalidoError as err:
@@ -2035,6 +2444,19 @@ def upload_youtube(caminho_video: str, titulo: str, roteiro: str) -> str:
 #   levemente, escolhe evitando repetir os últimos usados
 #   (`media_history.json`), com fallback automático para o antigo
 #   `VIDEO_FUNDO_PATH` se a biblioteca estiver vazia.
+#
+# FEITO (Provedor remoto Pexels): implementado na Fase 6 via
+#   `PexelsMediaProvider` — ver seção 0. Busca vídeos no Pexels a partir
+#   de palavras-chave extraídas do roteiro, baixa entre `PEXELS_MIN_DOWNLOADS_DESEJADOS`
+#   e `PEXELS_MAX_DOWNLOADS`, cacheia em `cache/pexels/` por `CACHE_TTL_HOURS`,
+#   e cai automaticamente para `LocalMediaProvider` se falhar por qualquer
+#   motivo. `MediaManager` não sabe mais de onde a mídia vem — só conversa
+#   com a interface `MediaProvider`.
+#
+# TODO (Pixabay / Unsplash / outros MediaProviders): a interface
+#   `MediaProvider` já está pronta para isso — bastaria uma nova classe
+#   implementando `listar_videos()`/`validar_video()`, sem tocar em
+#   `MediaManager`. Fora de escopo da Fase 6 por decisão explícita.
 #
 # TODO (Banco de músicas / Banco de efeitos sonoros / Banco de
 #   thumbnails): mesmo princípio do `MediaManager`, ainda não aplicado a
@@ -2129,9 +2551,10 @@ def main() -> None:
     """Executa o pipeline completo: roteiro -> áudio -> vídeo -> upload."""
     inicio_total = time.perf_counter()
     tempos: Dict[str, float] = {}
+    media_manager: Optional[MediaManager] = None
 
     try:
-        media_manager = MediaManager()
+        media_manager = _criar_media_manager()
         titulo, roteiro = _rodar_etapa("🧠 Gemini", tempos, gerar_roteiro)
         audio_path = _rodar_etapa("🎙 ElevenLabs", tempos, gerar_audio, roteiro)
         video_path = _rodar_etapa(
@@ -2153,6 +2576,11 @@ def main() -> None:
         # Remove arquivos temporários independentemente do resultado.
         if os.path.exists(NARRACAO_PATH):
             os.remove(NARRACAO_PATH)
+        # Libera espaço em disco (cache expirado, downloads interrompidos)
+        # — importante no runner efêmero do GitHub Actions, que não deve
+        # acumular arquivos entre execuções.
+        if media_manager is not None:
+            media_manager.limpar_cache_temporario()
 
 
 if __name__ == "__main__":
