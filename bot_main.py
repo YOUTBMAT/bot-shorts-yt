@@ -27,7 +27,6 @@ import time
 import random
 import bisect
 import unicodedata
-import resource
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -55,6 +54,12 @@ import moviepy.audio.fx.all as afx
 from googleapiclient.discovery import build
 from google.oauth2.credentials import Credentials
 from googleapiclient.http import MediaFileUpload
+from models.media import FundoInvalidoError, MediaItem
+
+try:
+    import resource
+except ImportError:
+    resource = None
 
 
 # ===========================================================================
@@ -263,24 +268,6 @@ STOPWORDS_PESQUISA = PALAVRAS_INSEPARAVEIS | {
 # fallback entre providers). Cada MediaProvider decide APENAS de onde a
 # mídia vem e como validá-la/descartá-la. Nenhum dos dois sabe nada sobre
 # Ken Burns, legendas, roteiro etc.
-class FundoInvalidoError(RuntimeError):
-    """Erro específico para quando o vídeo de fundo está ausente, vazio ou
-    corrompido. Separado de RuntimeError genérico de propósito: permite que
-    quem chama `criar_video()` saiba que é seguro descartar esse arquivo e
-    tentar outro da biblioteca de mídia, sem precisar interpretar o texto
-    da mensagem de erro."""
-
-
-@dataclass
-class MediaItem:
-    """Um item de mídia: caminho local (já baixado, se for remoto),
-    categoria (informativa — pasta de origem local, ou "pexels/<palavra>"
-    para itens remotos) e tipo ("video" ou "imagem")."""
-    caminho: str
-    categoria: str
-    tipo: str
-
-
 class MediaProvider(ABC):
     """Contrato único que qualquer fonte de mídia deve implementar (Local,
     Pexels, Pixabay, ...). Responsabilidade única: fornecer mídia — listar
@@ -460,6 +447,15 @@ class PexelsMediaProvider(MediaProvider):
         self.metadata_path = metadata_path
         os.makedirs(self.cache_dir, exist_ok=True)
         self._metadata: Dict[str, dict] = self._carregar_metadata()
+        # Blacklist em memória, válida só para esta execução (não é
+        # persistida): guarda os IDs de vídeos descartados por
+        # `descartar()` (ex.: passaram na validação mas falharam de
+        # verdade na renderização), para que um retry na mesma execução
+        # não busque/baixe o mesmo vídeo de novo — sem isso, como
+        # `descartar()` remove a entrada do metadata, o vídeo deixaria de
+        # ser reconhecido como "já visto" e poderia ser rebaixado e
+        # escolhido de novo no mesmo `escolher_fundo_e_criar_video()`.
+        self._rejeitados_nesta_execucao: set = set()
 
     # --- cache / metadata ---------------------------------------------------
     def _carregar_metadata(self) -> Dict[str, dict]:
@@ -626,6 +622,8 @@ class PexelsMediaProvider(MediaProvider):
                     continue  # ignora vídeos menores que a duração mínima
 
                 video_id = str(video.get("id"))
+                if video_id in self._rejeitados_nesta_execucao:
+                    continue  # descartado por falha de renderização nesta mesma execução
                 if video_id in self._metadata and self._cache_valido(self._metadata[video_id]):
                     continue  # já temos esse vídeo específico em cache
 
@@ -655,12 +653,14 @@ class PexelsMediaProvider(MediaProvider):
     def descartar(self, item: MediaItem) -> None:
         """Remove do metadata (não do disco — isso é papel de
         `limpar_cache_expirado()`) qualquer entrada apontando para este
-        arquivo, para que não seja reoferecido nem nesta execução nem na
-        próxima (força nova busca/download)."""
+        arquivo, e marca o(s) ID(s) correspondente(s) na blacklist desta
+        execução — para que não seja reoferecido nem nesta execução (via
+        nova busca) nem na próxima (via cache, já que saiu do metadata)."""
         alterado = False
         for video_id, entrada in list(self._metadata.items()):
             if entrada.get("caminho") == item.caminho:
                 self._metadata.pop(video_id, None)
+                self._rejeitados_nesta_execucao.add(video_id)
                 alterado = True
         if alterado:
             self._salvar_metadata()
@@ -745,6 +745,20 @@ class MediaManager:
         self._historico = self._historico[-MEDIA_HISTORICO_TAMANHO:]
         self._salvar_historico()
 
+    def confirmar_uso(self, caminho: str) -> None:
+        """Marca definitivamente um arquivo como usado no histórico
+        persistente. Só deve ser chamado por quem sabe que a mídia foi
+        REALMENTE aceita pelo pipeline (ex.: `criar_video()` terminou com
+        sucesso) — nunca no momento em que ela é apenas sorteada/validada.
+
+        `escolher_video()`/`escolher_imagem()` deliberadamente NÃO chamam
+        isto sozinhos: escolher é só "candidatar-se"; confirmar é quem
+        decide que o resultado final ficou pronto. Isso evita que uma
+        mídia sorteada mas descartada por falha de renderização (ver
+        `FundoInvalidoError` em `escolher_fundo_e_criar_video()`) polua o
+        histórico como se tivesse sido usada de verdade."""
+        self._registrar_uso(caminho)
+
     # --- escolha ------------------------------------------------------------
     def escolher_video(self, contexto: Optional[str] = None) -> str:
         """Escolhe um vídeo de fundo via o provider primário; se ele
@@ -752,7 +766,12 @@ class MediaManager:
         timeout, nenhum candidato válido...), cai para o provider de
         fallback (tipicamente `LocalMediaProvider`) sem propagar o erro —
         só loga um aviso. Se não houver fallback (ou o fallback for o
-        próprio primário), o erro sobe normalmente."""
+        próprio primário), o erro sobe normalmente.
+
+        IMPORTANTE: escolher NÃO marca a mídia como usada no histórico —
+        isso só acontece quando quem chamou confirma o sucesso real via
+        `confirmar_uso()` (ver docstring do método). Escolher é reversível
+        (pode ser seguido de `descartar()`); confirmar não é."""
         try:
             return self._escolher_de(self.provider, contexto)
         except Exception as err:
@@ -779,8 +798,10 @@ class MediaManager:
                 break
             tentativas += 1
             if provider.validar_video(candidato):
+                # Só registra QUAL provider forneceu o candidato (para
+                # `descartar()` saber a quem delegar). NÃO marca como usado
+                # aqui — ver `confirmar_uso()`.
                 self._origem[candidato.caminho] = provider
-                self._registrar_uso(candidato.caminho)
                 return candidato.caminho
             print(f"⚠️ Vídeo '{candidato.caminho}' não passou na validação; tentando outro.")
 
@@ -792,7 +813,9 @@ class MediaManager:
     def escolher_imagem(self) -> str:
         """Preparado para uso futuro — ainda não consumido pelo pipeline
         de vídeo. Só o `LocalMediaProvider` serve imagens por enquanto
-        (Pexels desta fase é só de vídeo)."""
+        (Pexels desta fase é só de vídeo). Mesma regra do vídeo: NÃO marca
+        como usada aqui — quem consumir precisa chamar `confirmar_uso()`
+        depois de aceitar a imagem de verdade."""
         provider = self.provider if isinstance(self.provider, LocalMediaProvider) else LocalMediaProvider()
         candidatos = list(provider.listar_imagens())
         if not candidatos:
@@ -808,7 +831,7 @@ class MediaManager:
                 break
             tentativas += 1
             if provider.validar_imagem(candidato):
-                self._registrar_uso(candidato.caminho)
+                self._origem[candidato.caminho] = provider
                 return candidato.caminho
 
         raise RuntimeError(f"❌ Nenhuma imagem válida encontrada em '{provider.pasta_imagens}'.")
@@ -2349,18 +2372,23 @@ def escolher_fundo_e_criar_video(roteiro: str, caminho_audio: str, media_manager
     Agora é `media_manager.escolher_video(contexto=roteiro)` — o roteiro é
     passado como contexto para que um provider remoto (Pexels) possa gerar
     palavras-chave de busca a partir dele; providers locais o ignoram. O
-    resto do pipeline não muda nada. Se o vídeo escolhido falhar durante a
-    renderização de verdade (`FundoInvalidoError`), descarta esse arquivo
-    do pool desta execução e tenta outro, até `MEDIA_MAX_TENTATIVAS` —
-    nunca derruba o workflow por causa de um único arquivo ruim que passou
-    pela validação leve mas falhou na hora de renderizar.
+    resto do pipeline não muda nada.
+
+    O histórico só é atualizado (`media_manager.confirmar_uso()`) DEPOIS
+    que `criar_video()` retorna com sucesso — nunca no momento da escolha.
+    Se o vídeo escolhido falhar durante a renderização de verdade
+    (`FundoInvalidoError`), descarta esse arquivo do pool desta execução
+    (sem jamais ter entrado no histórico) e tenta outro, até
+    `MEDIA_MAX_TENTATIVAS` — nunca derruba o workflow por causa de um único
+    arquivo ruim que passou pela validação leve mas falhou na hora de
+    renderizar.
     """
     ultimo_erro: Optional[Exception] = None
 
     for tentativa in range(1, MEDIA_MAX_TENTATIVAS + 1):
         caminho_fundo = media_manager.escolher_video(contexto=roteiro)
         try:
-            return criar_video(roteiro, caminho_audio, caminho_fundo)
+            caminho_saida = criar_video(roteiro, caminho_audio, caminho_fundo)
         except FundoInvalidoError as err:
             ultimo_erro = err
             media_manager.descartar(caminho_fundo)
@@ -2368,6 +2396,11 @@ def escolher_fundo_e_criar_video(roteiro: str, caminho_audio: str, media_manager
                 f"⚠️ Fundo '{caminho_fundo}' falhou durante a renderização ({err}); "
                 f"descartado desta execução. Tentativa {tentativa}/{MEDIA_MAX_TENTATIVAS}."
             )
+        else:
+            # Só agora, com o vídeo final de verdade pronto, a mídia é
+            # considerada "usada" e entra no histórico persistente.
+            media_manager.confirmar_uso(caminho_fundo)
+            return caminho_saida
 
     raise RuntimeError(
         f"❌ Nenhum vídeo de fundo funcionou após {MEDIA_MAX_TENTATIVAS} tentativas. "
@@ -2509,6 +2542,8 @@ def _formatar_linha_log(nome: str, status: str, duracao: float) -> str:
 def _ram_aproximada_mb() -> float:
     """RAM aproximada (pico de uso do processo) via stdlib, sem dependências
     novas. `ru_maxrss` vem em KB no Linux."""
+    if resource is None:
+        return 0.0
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
 
 
