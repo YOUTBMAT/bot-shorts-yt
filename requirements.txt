@@ -38,7 +38,7 @@ google-auth-oauthlib>=1.0.0,<2.0.0
 # A versão 9.5.0 tem wheel pré-compilada para cp310 manylinux (Python 3.10,
 # usado no agendador.yml), então instala normalmente no GitHub Actions sem
 # precisar compilar do zero.
-Pillow==9.5.0
+Pillow>=10.4.0
 
 # faster-whisper: pin de major. A API usada (WhisperModel, word_timestamps,
 # vad_filter) é da linha 1.x; teto <2.0.0 evita quebra em uma futura major.
