@@ -41,6 +41,7 @@ from PIL import Image
 from google import genai
 from google.genai import types
 from elevenlabs.client import ElevenLabs
+from google.api_core.client_options import ClientOptions
 from google.cloud import texttospeech
 from openai import OpenAI
 from faster_whisper import WhisperModel
@@ -83,8 +84,8 @@ RETRY_BACKOFF_JITTER: float = 0.5  # variação aleatória (0 a X segundos) soma
 
 # --- Narração (TTS com fallback entre provedores) ---
 # Prioridade automática, decidida em runtime pelas variáveis de ambiente
-# disponíveis (ver _provedores_tts_configurados()): Google Cloud TTS ->
-# OpenAI TTS -> ElevenLabs (mantido como fallback opcional/legado).
+# disponíveis (ver _provedores_tts_configurados()): OpenAI TTS -> Google
+# Cloud TTS -> ElevenLabs (mantido como fallback opcional/legado).
 GOOGLE_TTS_VOICE_NAME: str = "pt-BR-Chirp3-HD-Charon"  # voz HD (Chirp 3) em pt-BR
 GOOGLE_TTS_LANGUAGE_CODE: str = "pt-BR"
 GOOGLE_TTS_TIMEOUT_SECONDS: float = 120.0
@@ -1085,14 +1086,17 @@ def preparar_texto_para_narracao(texto: str) -> str:
 
 
 def _gerar_audio_google(texto: str, caminho_saida: str) -> str:
-    """Provedor 1 (principal): Google Cloud Text-to-Speech.
+    """Provedor 2 (fallback): Google Cloud Text-to-Speech.
 
-    Autenticação via credenciais padrão do ambiente (ADC) — o GitHub Actions
-    exporta GOOGLE_APPLICATION_CREDENTIALS apontando para um arquivo de
-    credencial temporário criado em runtime (ver agendador.yml). Nenhuma
-    credencial é lida diretamente do código.
+    Autenticação via API key (GOOGLE_TTS_API_KEY), não via credenciais de
+    conta de serviço/ADC. A API REST do Cloud TTS (texttospeech.googleapis.com)
+    aceita API key como método de autenticação (equivalente a `?key=...` na
+    REST), e a client library oficial expõe esse mesmo mecanismo através de
+    `ClientOptions(api_key=...)` — sem precisar de
+    GOOGLE_APPLICATION_CREDENTIALS nem de um arquivo de service account.
     """
-    client = texttospeech.TextToSpeechClient()
+    client_options = ClientOptions(api_key=os.environ.get("GOOGLE_TTS_API_KEY"))
+    client = texttospeech.TextToSpeechClient(client_options=client_options)
 
     entrada = texttospeech.SynthesisInput(text=texto)
     voz = texttospeech.VoiceSelectionParams(
@@ -1118,7 +1122,7 @@ def _gerar_audio_google(texto: str, caminho_saida: str) -> str:
 
 
 def _gerar_audio_openai(texto: str, caminho_saida: str) -> str:
-    """Provedor 2 (fallback): OpenAI Text-to-Speech.
+    """Provedor 1 (principal): OpenAI Text-to-Speech.
 
     A chave vem exclusivamente de OPENAI_API_KEY (variável de ambiente).
     """
@@ -1178,17 +1182,17 @@ def _erro_e_timeout(err: Exception) -> bool:
 
 def _provedores_tts_configurados() -> List[Tuple[str, Callable[[str, str], str]]]:
     """Monta a fila de provedores de TTS a partir das variáveis de ambiente
-    presentes, já na ordem de prioridade exigida: Google Cloud TTS -> OpenAI
+    presentes, já na ordem de prioridade exigida: OpenAI TTS -> Google Cloud
     TTS -> ElevenLabs. Um provedor sem credencial configurada simplesmente
     não entra na fila — a prioridade é 100% automática, sem precisar tocar
     no código para trocar de provedor."""
     provedores: List[Tuple[str, Callable[[str, str], str]]] = []
 
-    if os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
-        provedores.append(("Google Cloud TTS", _gerar_audio_google))
-
     if os.environ.get("OPENAI_API_KEY"):
         provedores.append(("OpenAI TTS", _gerar_audio_openai))
+
+    if os.environ.get("GOOGLE_TTS_API_KEY"):
+        provedores.append(("Google Cloud TTS", _gerar_audio_google))
 
     if os.environ.get("ELEVENLABS_API_KEY"):
         provedores.append(("ElevenLabs", _gerar_audio_elevenlabs))
@@ -1198,8 +1202,8 @@ def _provedores_tts_configurados() -> List[Tuple[str, Callable[[str, str], str]]
 
 def gerar_audio(texto: str, caminho_saida: str = NARRACAO_PATH) -> str:
     """Gera o arquivo de narração em áudio a partir do roteiro, tentando os
-    provedores de TTS configurados em ordem de prioridade (Google Cloud TTS
-    -> OpenAI TTS -> ElevenLabs) até um deles funcionar.
+    provedores de TTS configurados em ordem de prioridade (OpenAI TTS ->
+    Google Cloud TTS -> ElevenLabs) até um deles funcionar.
 
     Erro de entrada (roteiro vazio/inválido) nunca é mascarado como falha de
     provedor: é validado uma única vez, antes de qualquer tentativa. Falhas
@@ -1215,8 +1219,8 @@ def gerar_audio(texto: str, caminho_saida: str = NARRACAO_PATH) -> str:
     provedores = _provedores_tts_configurados()
     if not provedores:
         raise RuntimeError(
-            "❌ TTS: nenhum provedor configurado. Defina GOOGLE_APPLICATION_CREDENTIALS, "
-            "OPENAI_API_KEY ou ELEVENLABS_API_KEY."
+            "❌ TTS: nenhum provedor configurado. Defina OPENAI_API_KEY, "
+            "GOOGLE_TTS_API_KEY ou ELEVENLABS_API_KEY."
         )
 
     erros: List[str] = []
