@@ -69,7 +69,7 @@ except ImportError:
 # mágico" deve aparecer solto no restante do código.
 
 # --- Roteiro (Gemini) ---
-MODEL_PRIORITY: List[str] = ["gemini-2.5-flash", "gemini-3.6-flash"]
+MODEL_PRIORITY: List[str] = ["gemini-3.6-flash"]
 MAX_RETRIES: int = 2  # tentativas por modelo antes de passar para o próximo
 ROTEIRO_MIN_PALAVRAS: int = 65
 ROTEIRO_MAX_PALAVRAS: int = 85
