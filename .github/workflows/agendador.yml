@@ -50,9 +50,25 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel
           pip install -r requirements.txt
 
+      - name: 6.5. Configurar credencial do Google Cloud TTS (opcional)
+        # Opcional: sem essa secret configurada, este provedor simplesmente
+        # nao entra na fila e o bot cai para OpenAI/ElevenLabs -- ver
+        # _provedores_tts_configurados() em bot_main.py. A credencial (JSON
+        # de service account) fica so em memoria/no diretorio temporario do
+        # runner (RUNNER_TEMP), nunca e commitada no repositorio, e o runner
+        # e efemero (descartado ao fim do job).
+        if: ${{ secrets.GOOGLE_APPLICATION_CREDENTIALS_JSON != '' }}
+        run: |
+          echo '${{ secrets.GOOGLE_APPLICATION_CREDENTIALS_JSON }}' > "$RUNNER_TEMP/gcp-credentials.json"
+          echo "GOOGLE_APPLICATION_CREDENTIALS=$RUNNER_TEMP/gcp-credentials.json" >> "$GITHUB_ENV"
+
       - name: 7. Executar o Bot Automatico
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          # Opcional: sem essa secret configurada, este provedor simplesmente
+          # nao entra na fila de TTS -- ver _provedores_tts_configurados().
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          # Fallback legado: continua funcionando exatamente como antes.
           ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
           YOUTUBE_TOKEN_JSON: ${{ secrets.YOUTUBE_TOKEN_JSON }}
           # Opcional: sem essa secret configurada, o bot funciona

@@ -1,7 +1,8 @@
 """
 Bot Automático de Publicação de YouTube Shorts.
 
-Pipeline: gera roteiro (Gemini) -> gera narração (ElevenLabs) -> transcreve
+Pipeline: gera roteiro (Gemini) -> gera narração (TTS: Google Cloud -> OpenAI
+-> ElevenLabs, com fallback automático) -> transcreve
 a narração com timestamps por palavra (faster-whisper) -> monta vídeo com
 legendas sincronizadas palavra-a-palavra e legendas dinâmicas (MoviePy) ->
 publica no YouTube.
@@ -33,13 +34,15 @@ import urllib.parse
 import socket
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Callable
 
 import numpy as np
 from PIL import Image
 from google import genai
 from google.genai import types
 from elevenlabs.client import ElevenLabs
+from google.cloud import texttospeech
+from openai import OpenAI
 from faster_whisper import WhisperModel
 from moviepy.editor import (
     VideoFileClip,
@@ -78,10 +81,24 @@ TITULO_MAX_CARACTERES: int = 90
 RETRY_BACKOFF_BASE: float = 1.0  # segundos; dobra a cada nova tentativa (1, 2, 4...)
 RETRY_BACKOFF_JITTER: float = 0.5  # variação aleatória (0 a X segundos) somada à espera
 
-# --- Narração (ElevenLabs) ---
-VOICE_ID: str = "pNInz6obpgDQGcFmaJgB"  # Voz "Adam"
+# --- Narração (TTS com fallback entre provedores) ---
+# Prioridade automática, decidida em runtime pelas variáveis de ambiente
+# disponíveis (ver _provedores_tts_configurados()): Google Cloud TTS ->
+# OpenAI TTS -> ElevenLabs (mantido como fallback opcional/legado).
+GOOGLE_TTS_VOICE_NAME: str = "pt-BR-Chirp3-HD-Charon"  # voz HD (Chirp 3) em pt-BR
+GOOGLE_TTS_LANGUAGE_CODE: str = "pt-BR"
+GOOGLE_TTS_TIMEOUT_SECONDS: float = 120.0
+
+OPENAI_TTS_MODEL: str = "gpt-4o-mini-tts"
+OPENAI_TTS_VOICE: str = "onyx"  # voz grave, natural para narração de Shorts
+OPENAI_TTS_TIMEOUT_SECONDS: float = 120.0
+
+VOICE_ID: str = "pNInz6obpgDQGcFmaJgB"  # ElevenLabs, voz "Adam" (fallback legado)
 ELEVEN_MODEL_ID: str = "eleven_multilingual_v2"
 ELEVENLABS_TIMEOUT_SECONDS: float = 120.0  # evita que uma chamada travada prenda o job do GitHub Actions
+
+TTS_TENTATIVAS_POR_PROVEDOR: int = 2  # antes de cair para o próximo provedor; mesmo padrão do MODEL_PRIORITY do Gemini
+
 NARRACAO_PATH: str = "narracao.mp3"
 
 # --- Vídeo (MoviePy) ---
@@ -1031,7 +1048,7 @@ def gerar_roteiro() -> Tuple[str, str]:
 
 
 # ===========================================================================
-# 2. GERAR ÁUDIO (ElevenLabs)
+# 2. GERAR ÁUDIO (TTS com fallback: Google Cloud -> OpenAI -> ElevenLabs)
 # ===========================================================================
 def preparar_texto_para_narracao(texto: str) -> str:
     """Ajusta o texto para soar mais natural quando narrado.
@@ -1067,38 +1084,170 @@ def preparar_texto_para_narracao(texto: str) -> str:
     return texto.strip()
 
 
-def gerar_audio(texto: str, caminho_saida: str = NARRACAO_PATH) -> str:
-    """Gera o arquivo de narração em áudio a partir do roteiro."""
-    print("🎙️ [2/4] Gerando voz ultra-realista com a ElevenLabs...")
-    texto_narracao = preparar_texto_para_narracao(texto)
+def _gerar_audio_google(texto: str, caminho_saida: str) -> str:
+    """Provedor 1 (principal): Google Cloud Text-to-Speech.
 
-    client = ElevenLabs(api_key=os.environ.get("ELEVENLABS_API_KEY"), timeout=ELEVENLABS_TIMEOUT_SECONDS)
+    Autenticação via credenciais padrão do ambiente (ADC) — o GitHub Actions
+    exporta GOOGLE_APPLICATION_CREDENTIALS apontando para um arquivo de
+    credencial temporário criado em runtime (ver agendador.yml). Nenhuma
+    credencial é lida diretamente do código.
+    """
+    client = texttospeech.TextToSpeechClient()
 
-    try:
-        audio_stream = client.text_to_speech.convert(
-            voice_id=VOICE_ID,
-            text=texto_narracao,
-            model_id=ELEVEN_MODEL_ID,
-        )
+    entrada = texttospeech.SynthesisInput(text=texto)
+    voz = texttospeech.VoiceSelectionParams(
+        language_code=GOOGLE_TTS_LANGUAGE_CODE,
+        name=GOOGLE_TTS_VOICE_NAME,
+    )
+    audio_config = texttospeech.AudioConfig(audio_encoding=texttospeech.AudioEncoding.MP3)
 
-        bytes_escritos = 0
-        with open(caminho_saida, "wb") as arquivo:
-            for chunk in audio_stream:
-                if chunk:
-                    arquivo.write(chunk)
-                    bytes_escritos += len(chunk)
+    resposta = client.synthesize_speech(
+        input=entrada,
+        voice=voz,
+        audio_config=audio_config,
+        timeout=GOOGLE_TTS_TIMEOUT_SECONDS,
+    )
 
-    except Exception as err:
-        # Cobre tanto erro de rede/timeout (a lib já usa um timeout padrão de
-        # ELEVENLABS_TIMEOUT_SECONDS, então "demora demais" também cai aqui)
-        # quanto qualquer outra falha da API.
-        raise RuntimeError(f"❌ ElevenLabs: falha ao gerar a narração ({err}).") from err
+    if not resposta.audio_content:
+        raise RuntimeError("Google Cloud TTS: a narração gerada está vazia (0 bytes).")
 
-    if bytes_escritos == 0:
-        # A API "funcionou" (não lançou erro) mas devolveu um áudio vazio.
-        raise RuntimeError("❌ ElevenLabs: a narração gerada está vazia (0 bytes).")
+    with open(caminho_saida, "wb") as arquivo:
+        arquivo.write(resposta.audio_content)
 
     return caminho_saida
+
+
+def _gerar_audio_openai(texto: str, caminho_saida: str) -> str:
+    """Provedor 2 (fallback): OpenAI Text-to-Speech.
+
+    A chave vem exclusivamente de OPENAI_API_KEY (variável de ambiente).
+    """
+    client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"), timeout=OPENAI_TTS_TIMEOUT_SECONDS)
+
+    with client.audio.speech.with_streaming_response.create(
+        model=OPENAI_TTS_MODEL,
+        voice=OPENAI_TTS_VOICE,
+        input=texto,
+    ) as resposta:
+        resposta.stream_to_file(caminho_saida)
+
+    if not os.path.exists(caminho_saida) or os.path.getsize(caminho_saida) == 0:
+        raise RuntimeError("OpenAI TTS: a narração gerada está vazia (0 bytes).")
+
+    return caminho_saida
+
+
+def _gerar_audio_elevenlabs(texto: str, caminho_saida: str) -> str:
+    """Provedor 3 (fallback legado): ElevenLabs — mantido por compatibilidade.
+
+    A chave existente ELEVENLABS_API_KEY continua funcionando exatamente
+    como antes; se ela não existir, este provedor simplesmente não entra na
+    fila (ver _provedores_tts_configurados()).
+    """
+    client = ElevenLabs(api_key=os.environ.get("ELEVENLABS_API_KEY"), timeout=ELEVENLABS_TIMEOUT_SECONDS)
+
+    audio_stream = client.text_to_speech.convert(
+        voice_id=VOICE_ID,
+        text=texto,
+        model_id=ELEVEN_MODEL_ID,
+    )
+
+    bytes_escritos = 0
+    with open(caminho_saida, "wb") as arquivo:
+        for chunk in audio_stream:
+            if chunk:
+                arquivo.write(chunk)
+                bytes_escritos += len(chunk)
+
+    if bytes_escritos == 0:
+        raise RuntimeError("ElevenLabs: a narração gerada está vazia (0 bytes).")
+
+    return caminho_saida
+
+
+def _erro_e_timeout(err: Exception) -> bool:
+    """Heurística simples para reconhecer timeout (o único caso em que se
+    tenta de novo o MESMO provedor, com retry/backoff, antes de cair para o
+    próximo — os demais tipos de falha de provedor vão direto para o
+    próximo)."""
+    if isinstance(err, (socket.timeout, TimeoutError)):
+        return True
+    mensagem = str(err).lower()
+    return "timeout" in mensagem or "timed out" in mensagem or "deadline exceeded" in mensagem
+
+
+def _provedores_tts_configurados() -> List[Tuple[str, Callable[[str, str], str]]]:
+    """Monta a fila de provedores de TTS a partir das variáveis de ambiente
+    presentes, já na ordem de prioridade exigida: Google Cloud TTS -> OpenAI
+    TTS -> ElevenLabs. Um provedor sem credencial configurada simplesmente
+    não entra na fila — a prioridade é 100% automática, sem precisar tocar
+    no código para trocar de provedor."""
+    provedores: List[Tuple[str, Callable[[str, str], str]]] = []
+
+    if os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
+        provedores.append(("Google Cloud TTS", _gerar_audio_google))
+
+    if os.environ.get("OPENAI_API_KEY"):
+        provedores.append(("OpenAI TTS", _gerar_audio_openai))
+
+    if os.environ.get("ELEVENLABS_API_KEY"):
+        provedores.append(("ElevenLabs", _gerar_audio_elevenlabs))
+
+    return provedores
+
+
+def gerar_audio(texto: str, caminho_saida: str = NARRACAO_PATH) -> str:
+    """Gera o arquivo de narração em áudio a partir do roteiro, tentando os
+    provedores de TTS configurados em ordem de prioridade (Google Cloud TTS
+    -> OpenAI TTS -> ElevenLabs) até um deles funcionar.
+
+    Erro de entrada (roteiro vazio/inválido) nunca é mascarado como falha de
+    provedor: é validado uma única vez, antes de qualquer tentativa. Falhas
+    de provedor (quota, autenticação, indisponibilidade, timeout, erro
+    inesperado) fazem cair para o próximo da fila; timeout especificamente
+    tenta de novo o mesmo provedor (retry/backoff) antes de trocar.
+    """
+    if not texto or not texto.strip():
+        raise ValueError("gerar_audio: roteiro vazio ou inválido.")
+
+    texto_narracao = preparar_texto_para_narracao(texto)
+
+    provedores = _provedores_tts_configurados()
+    if not provedores:
+        raise RuntimeError(
+            "❌ TTS: nenhum provedor configurado. Defina GOOGLE_APPLICATION_CREDENTIALS, "
+            "OPENAI_API_KEY ou ELEVENLABS_API_KEY."
+        )
+
+    erros: List[str] = []
+
+    for nome, func in provedores:
+        print(f"🎙️ [2/4] Gerando narração com {nome}...")
+
+        for tentativa in range(1, TTS_TENTATIVAS_POR_PROVEDOR + 1):
+            try:
+                func(texto_narracao, caminho_saida)
+                print(f"✅ Narração gerada com {nome}.")
+                return caminho_saida
+
+            except Exception as err:
+                # Nunca logar API keys/credenciais — só a mensagem da
+                # exceção (as libs oficiais não ecoam a chave nela).
+                print(f"⚠️ Falha em {nome} (tentativa {tentativa}/{TTS_TENTATIVAS_POR_PROVEDOR}): {err}")
+
+                if _erro_e_timeout(err) and tentativa < TTS_TENTATIVAS_POR_PROVEDOR:
+                    espera = RETRY_BACKOFF_BASE * (2 ** (tentativa - 1))
+                    espera += random.uniform(0, RETRY_BACKOFF_JITTER)
+                    print(f"⏳ Timeout em {nome}, nova tentativa em {espera:.1f}s...")
+                    time.sleep(espera)
+                    continue
+
+                erros.append(f"{nome}: {err}")
+                break  # próximo provedor da fila
+
+    raise RuntimeError(
+        "❌ TTS: todos os provedores configurados falharam. Detalhes: " + " | ".join(erros)
+    )
 
 
 # ===========================================================================
@@ -2505,12 +2654,6 @@ def upload_youtube(caminho_video: str, titulo: str, roteiro: str) -> str:
 #   plugaria como uma função `escolher_*(roteiro, banco) -> item`, chamada
 #   antes de `criar_video()`/`upload_youtube()`.
 #
-# TODO (Múltiplos provedores de TTS): `gerar_audio()` está fortemente
-#   acoplada à ElevenLabs. Generalizar exigiria extrair uma interface comum
-#   (texto -> arquivo de áudio) e uma constante tipo `TTS_PROVIDER` para
-#   escolher entre provedores, com fallback entre eles (mesmo padrão já
-#   usado para `MODEL_PRIORITY` do Gemini).
-#
 # TODO (Cache inteligente): já existe um cache local por execução
 #   (`_CACHE_PALAVRAS_RENDERIZADAS`, seção 3.1) para tiles de legenda. Uma
 #   fase futura poderia persistir esse cache entre execuções (ex: palavras
@@ -2591,7 +2734,7 @@ def main() -> None:
     try:
         media_manager = _criar_media_manager()
         titulo, roteiro = _rodar_etapa("🧠 Gemini", tempos, gerar_roteiro)
-        audio_path = _rodar_etapa("🎙 ElevenLabs", tempos, gerar_audio, roteiro)
+        audio_path = _rodar_etapa("🎙 Narração (TTS)", tempos, gerar_audio, roteiro)
         video_path = _rodar_etapa(
             "🎬 Render", tempos, escolher_fundo_e_criar_video, roteiro, audio_path, media_manager
         )

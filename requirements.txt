@@ -8,6 +8,16 @@ google-genai>=1.0.0,<3.0.0
 # a 1.x. Teto <3.0.0 evita quebra silenciosa em uma futura major.
 elevenlabs>=1.0.0,<3.0.0
 
+# google-cloud-texttospeech: provedor principal de TTS (fallback ->
+# openai -> elevenlabs). Usamos client.synthesize_speech() com
+# VoiceSelectionParams/AudioConfig, API estável desde a 2.x.
+google-cloud-texttospeech>=2.16.0,<3.0.0
+
+# openai: provedor de TTS fallback (client.audio.speech.with_streaming_response
+# .create()). O projeto já não tinha essa dependência; teto de major para
+# evitar quebra silenciosa, igual ao padrão usado nas outras libs acima.
+openai>=1.50.0,<4.0.0
+
 # moviepy: PIN EXATO, não relaxar. moviepy 2.x removeu o módulo
 # `moviepy.editor` inteiro e renomeou métodos (.resize -> .resized,
 # .set_start -> .with_start, etc.) — o projeto inteiro depende da API 1.x.
