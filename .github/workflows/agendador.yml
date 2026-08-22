@@ -55,5 +55,9 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
           YOUTUBE_TOKEN_JSON: ${{ secrets.YOUTUBE_TOKEN_JSON }}
+          # Opcional: sem essa secret configurada, o bot funciona
+          # normalmente usando so a biblioteca local (assets/videos/)
+          # como antes -- ver _criar_media_manager() em bot_main.py.
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
         run: |
           python bot_main.py
