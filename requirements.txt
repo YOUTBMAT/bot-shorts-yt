@@ -24,25 +24,40 @@ openai>=1.50.0,<4.0.0
 # moviepy: PIN EXATO, não relaxar. moviepy 2.x removeu o módulo
 # `moviepy.editor` inteiro e renomeou métodos (.resize -> .resized,
 # .set_start -> .with_start, etc.) — o projeto inteiro depende da API 1.x.
+# Compatibilidade com Python 3.14: moviepy 1.0.3 é distribuído só como
+# sdist (sem wheel) e não declara `python_requires`, mas o pacote em si é
+# puro Python (sem extensão C) — instala e importa normalmente sob 3.14
+# desde que setuptools/wheel estejam presentes no ambiente de build (ver
+# passo 6 do agendador.yml, que já faz
+# `pip install --upgrade pip setuptools wheel` antes do `pip install -r
+# requirements.txt`). O único ponto de incompatibilidade real do moviepy
+# 1.0.3 com Python/Pillow modernos é o uso de `Image.ANTIALIAS` dentro de
+# `moviepy/video/fx/resize.py` — corrigido via shim em bot_main.py (ver
+# comentário ao lado de `if not hasattr(Image, "ANTIALIAS")`), não aqui no
+# requirements.txt.
 moviepy==1.0.3
 
 google-api-python-client>=2.100.0,<3.0.0
 google-auth-httplib2>=0.2.0,<1.0.0
 google-auth-oauthlib>=1.0.0,<2.0.0
 
-# Pillow: PIN EXATO, não relaxar — CRÍTICO, não é só preferência de
-# estabilidade. moviepy 1.0.3 usa `Image.ANTIALIAS` como fallback do
-# resizer quando o OpenCV (cv2) não está disponível — e este projeto NÃO
-# depende de opencv. `Image.ANTIALIAS` foi REMOVIDO no Pillow >= 10.0,
-# quebrando TODO `.resize()` de clip (usado no Ken Burns e no
-# redimensionamento do vídeo de fundo). Reproduzido e confirmado em teste
-# isolado: com Pillow >= 10 e sem cv2, `clip.resize(...)` lança
-# `AttributeError: module 'PIL.Image' has no attribute 'ANTIALIAS'`.
-# A versão 9.5.0 tem wheel pré-compilada para cp310 manylinux (Python 3.10,
-# usado no agendador.yml), então instala normalmente no GitHub Actions sem
-# precisar compilar do zero.
+# Pillow: teto aberto proposital (>=10.4.0, sem <11/<12). `Image.ANTIALIAS`
+# foi REMOVIDO no Pillow >= 10.0 (era usado por moviepy 1.0.3 como fallback
+# do resizer quando o OpenCV/cv2 não está disponível — e este projeto NÃO
+# depende de opencv), o que quebraria TODO `.resize()` de clip (Ken Burns e
+# redimensionamento do vídeo de fundo) com
+# `AttributeError: module 'PIL.Image' has no attribute 'ANTIALIAS'`. Isso é
+# corrigido em runtime por um shim no início de bot_main.py
+# (`Image.ANTIALIAS = Image.Resampling.LANCZOS` se o atributo não existir),
+# então não há mais necessidade de pin exato numa versão antiga do Pillow:
+# qualquer Pillow >= 10.4 funciona, incluindo as versões com wheel para
+# Python 3.14 (verificado: Pillow já publica wheel cp314 no PyPI).
 Pillow>=10.4.0
 
 # faster-whisper: pin de major. A API usada (WhisperModel, word_timestamps,
 # vad_filter) é da linha 1.x; teto <2.0.0 evita quebra em uma futura major.
+# Compatibilidade com Python 3.14: faster-whisper em si é puro Python; suas
+# dependências nativas (ctranslate2, onnxruntime, av/PyAV) já publicam
+# wheel cp314 no PyPI, e `tokenizers` publica wheel abi3 (cp310-abi3, que
+# também roda em 3.14). Nenhuma dependência da cadeia precisou de troca.
 faster-whisper>=1.0.0,<2.0.0

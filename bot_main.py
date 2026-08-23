@@ -38,6 +38,21 @@ from typing import List, Tuple, Optional, Dict, Callable
 
 import numpy as np
 from PIL import Image
+
+# Compat: moviepy 1.0.3 usa `Image.ANTIALIAS` internamente (resizer PIL, em
+# moviepy/video/fx/resize.py — usado quando o OpenCV/cv2 não está
+# disponível, e este projeto NÃO depende de opencv). `Image.ANTIALIAS` foi
+# removido no Pillow >= 10.0 (era só um alias de `Image.LANCZOS` desde o
+# Pillow 2.7, mantido por compatibilidade). Sem este shim, TODO
+# `clip.resize(...)` (usado no Ken Burns e no redimensionamento do vídeo de
+# fundo) lança `AttributeError: module 'PIL.Image' has no attribute
+# 'ANTIALIAS'`. Não altera nada além de re-registrar o nome antigo — o
+# `Image.BILINEAR` usado diretamente mais abaixo neste arquivo não foi
+# afetado pela remoção (só o ANTIALIAS foi removido no Pillow 10; os demais
+# filtros nomeados como constante, como BILINEAR, foram restaurados na 9.4).
+if not hasattr(Image, "ANTIALIAS"):
+    Image.ANTIALIAS = Image.Resampling.LANCZOS
+
 from google import genai
 from google.genai import types
 from elevenlabs.client import ElevenLabs
