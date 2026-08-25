@@ -553,5 +553,315 @@ class TestRetryNaoRepeteImediatamente(unittest.TestCase):
         self.assertEqual(segmentos, [(0.0, 4.0)])
 
 
+# ===========================================================================
+# 13. normalize_frame_size() — utilitário central de normalização de
+#     dimensões (Problema 4/5 da auditoria: broadcasting entre frame e
+#     máscara de tamanhos ligeiramente diferentes)
+# ===========================================================================
+class TestNormalizeFrameSize(unittest.TestCase):
+    def test_bug_original_frame_1921_mask_1918_normalizam_para_o_mesmo_alvo(self):
+        import numpy as np
+
+        frame = np.zeros((1921, 1080, 3), dtype="uint8")
+        mascara = np.ones((1918, 1080), dtype="float32")
+
+        frame_norm = bot_main.normalize_frame_size(frame, altura=1920, largura=1080)
+        mascara_norm = bot_main.normalize_frame_size(mascara, altura=1920, largura=1080)
+
+        self.assertEqual(frame_norm.shape, (1920, 1080, 3))
+        self.assertEqual(mascara_norm.shape, (1920, 1080))
+        # Depois de normalizados, a operação que antes quebrava
+        # (broadcasting entre frame e máscara) passa a funcionar.
+        resultado = frame_norm.astype("float32") * mascara_norm[..., None]
+        self.assertEqual(resultado.shape, (1920, 1080, 3))
+
+    def test_mascara_grayscale_h_w(self):
+        import numpy as np
+
+        mascara = np.ones((100, 50), dtype="float32")
+        resultado = bot_main.normalize_frame_size(mascara, altura=90, largura=60)
+        self.assertEqual(resultado.shape, (90, 60))
+
+    def test_mascara_h_w_1(self):
+        import numpy as np
+
+        mascara = np.ones((100, 50, 1), dtype="float32")
+        resultado = bot_main.normalize_frame_size(mascara, altura=90, largura=60)
+        self.assertEqual(resultado.shape, (90, 60, 1))
+
+    def test_frame_rgb_h_w_3(self):
+        import numpy as np
+
+        frame = np.zeros((100, 50, 3), dtype="uint8")
+        resultado = bot_main.normalize_frame_size(frame, altura=110, largura=45)
+        self.assertEqual(resultado.shape, (110, 45, 3))
+
+    def test_frame_rgba_h_w_4(self):
+        import numpy as np
+
+        frame = np.zeros((100, 50, 4), dtype="uint8")
+        resultado = bot_main.normalize_frame_size(frame, altura=95, largura=55)
+        self.assertEqual(resultado.shape, (95, 55, 4))
+
+    def test_dimensoes_impares(self):
+        import numpy as np
+
+        frame = np.zeros((101, 51, 3), dtype="uint8")
+        resultado = bot_main.normalize_frame_size(frame, altura=100, largura=50)
+        self.assertEqual(resultado.shape, (100, 50, 3))
+
+        frame_menor = np.zeros((99, 49, 3), dtype="uint8")
+        resultado_menor = bot_main.normalize_frame_size(frame_menor, altura=100, largura=50)
+        self.assertEqual(resultado_menor.shape, (100, 50, 3))
+
+    def test_ja_no_tamanho_certo_retorna_sem_alterar_conteudo(self):
+        import numpy as np
+
+        frame = np.arange(100 * 50 * 3, dtype="uint8").reshape(100, 50, 3)
+        resultado = bot_main.normalize_frame_size(frame, altura=100, largura=50)
+        self.assertTrue((resultado == frame).all())
+
+    def test_padding_replica_borda_em_vez_de_inventar_preto(self):
+        import numpy as np
+
+        frame = np.full((10, 10, 3), 200, dtype="uint8")
+        resultado = bot_main.normalize_frame_size(frame, altura=12, largura=10)
+        # As linhas adicionadas (padding) replicam a borda (200), nunca
+        # viram preto artificial (0) — não é um "broadcast artificial".
+        self.assertTrue((resultado[0] == 200).all())
+        self.assertTrue((resultado[-1] == 200).all())
+
+
+# ===========================================================================
+# 14. _redimensionar_para_vertical() — consistência de dimensões entre
+#     vídeos de fundo de aspect ratios de origem diferentes (causa raiz do
+#     bug de broadcasting: cada segmento de B-roll podia terminar com uma
+#     altura ligeiramente diferente)
+# ===========================================================================
+class FakeVideoClipGeometria:
+    """Fake mínimo de VideoFileClip que reproduz o MESMO arredondamento
+    (`int(round(...))`) que o MoviePy real usa em `.crop()`/`.resize()` —
+    necessário para reproduzir de verdade a divergência de 1-3px entre
+    vídeos de origem diferentes que motivou o bug."""
+
+    def __init__(self, size):
+        self.size = size  # (largura, altura), convenção do MoviePy
+
+    def crop(self, x1=0, y1=0, width=None, height=None):
+        w = int(round(width)) if width is not None else self.size[0]
+        h = int(round(height)) if height is not None else self.size[1]
+        return FakeVideoClipGeometria((w, h))
+
+    def resize(self, width=None, height=None):
+        w, h = self.size
+        if width is not None:
+            fator = width / w
+            return FakeVideoClipGeometria((int(round(width)), int(round(h * fator))))
+        if height is not None:
+            fator = height / h
+            return FakeVideoClipGeometria((int(round(w * fator)), int(round(height))))
+        return FakeVideoClipGeometria(self.size)
+
+    def fl_image(self, func):
+        import numpy as np
+
+        largura, altura = self.size
+        frame_fake = np.zeros((altura, largura, 3), dtype="uint8")
+        novo_frame = func(frame_fake)
+        nova_altura, nova_largura = novo_frame.shape[:2]
+        return FakeVideoClipGeometria((nova_largura, nova_altura))
+
+
+class TestRedimensionarParaVerticalConsistencia(unittest.TestCase):
+    def _tamanho_final(self, largura_original, altura_original):
+        with mock.patch("bot_main._debug_registrar"):
+            resultado = bot_main._redimensionar_para_vertical(
+                FakeVideoClipGeometria((largura_original, altura_original))
+            )
+        return resultado.size
+
+    def test_varios_aspect_ratios_de_origem_produzem_sempre_o_mesmo_tamanho(self):
+        # Resoluções de origem bem diferentes (típicas de B-roll do Pexels
+        # e de bibliotecas locais) — TODAS precisam terminar EXATAMENTE no
+        # mesmo canvas, senão a concatenação de segmentos volta a poder
+        # gerar o `operands could not be broadcast together` original.
+        origens = [
+            (1920, 1080),  # 16:9 "padrão" do Pexels
+            (1280, 720),
+            (3840, 2160),  # 4K
+            (1080, 1350),  # já quase vertical, mas não exatamente 9:16
+            (1000, 563),   # aspect ratio "estranho", gera crop fracionário
+            (1917, 1079),  # ímpar, propositalmente feito pra estressar o arredondamento
+        ]
+        for largura, altura in origens:
+            with self.subTest(origem=(largura, altura)):
+                tamanho_final = self._tamanho_final(largura, altura)
+                self.assertEqual(tamanho_final, (bot_main.VIDEO_WIDTH, bot_main.VIDEO_HEIGHT))
+
+    def test_altura_alvo_e_1920_para_largura_1080(self):
+        self.assertEqual(bot_main.VIDEO_HEIGHT, 1920)
+
+
+# ===========================================================================
+# 15. User-Agent do Pexels + diagnóstico específico do bloqueio Cloudflare
+#     (HTTP 403 / "error code: 1010") — Problema 1 da auditoria
+# ===========================================================================
+class TestPexelsUserAgentECloudflare(unittest.TestCase):
+    def setUp(self):
+        self.provider = bot_main.PexelsMediaProvider.__new__(bot_main.PexelsMediaProvider)
+        self.provider.api_key = "chave-de-teste-1234567890"
+
+    def test_busca_envia_user_agent_de_navegador(self):
+        capturado = {}
+
+        class _RespostaFake:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return json.dumps({"videos": []}).encode("utf-8")
+
+        def fake_urlopen(requisicao, timeout=None):
+            capturado["headers"] = dict(requisicao.header_items())
+            return _RespostaFake()
+
+        with mock.patch("bot_main.urllib.request.urlopen", side_effect=fake_urlopen):
+            self.provider._buscar("saturn rings")
+
+        # urllib normaliza o nome do header para "User-agent" (capitalização
+        # própria dele) — o que importa é que o valor de navegador chegou.
+        headers_lower = {k.lower(): v for k, v in capturado["headers"].items()}
+        self.assertIn("user-agent", headers_lower)
+        self.assertEqual(headers_lower["user-agent"], bot_main.PEXELS_USER_AGENT)
+        self.assertNotIn("python-urllib", headers_lower["user-agent"].lower())
+
+    def test_download_envia_user_agent_de_navegador(self):
+        capturado = {}
+
+        class _RespostaFake:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return b"conteudo-fake-de-video"
+
+        def fake_urlopen(requisicao, timeout=None):
+            capturado["headers"] = dict(requisicao.header_items())
+            return _RespostaFake()
+
+        destino = os.path.join(_diretorio_temporario_para_teste(self), "video.mp4")
+        with mock.patch("bot_main.urllib.request.urlopen", side_effect=fake_urlopen):
+            ok = self.provider._baixar_arquivo("https://player.vimeo.com/x.mp4", destino)
+
+        self.assertTrue(ok)
+        headers_lower = {k.lower(): v for k, v in capturado["headers"].items()}
+        self.assertIn("user-agent", headers_lower)
+        self.assertEqual(headers_lower["user-agent"], bot_main.PEXELS_USER_AGENT)
+
+    def test_403_com_corpo_1010_gera_mensagem_especifica_de_cloudflare(self):
+        corpo = b"error code: 1010"
+
+        class _ErroFake(urllib.error.HTTPError):
+            def __init__(self):
+                super().__init__("https://api.pexels.com/videos/search", 403, "Forbidden", {}, io.BytesIO(corpo))
+
+            def read(self):
+                return corpo
+
+        with mock.patch("bot_main.urllib.request.urlopen", side_effect=_ErroFake()):
+            with self.assertRaises(RuntimeError) as ctx:
+                self.provider._buscar("saturn rings")
+
+        self.assertIn("Cloudflare", str(ctx.exception))
+        self.assertIn("1010", str(ctx.exception))
+        # E continua sem nunca vazar a API key na mensagem.
+        self.assertNotIn(self.provider.api_key, str(ctx.exception))
+
+    def test_403_sem_1010_mantem_mensagem_generica_de_conta_key(self):
+        corpo = b'{"error":"forbidden"}'
+
+        class _ErroFake(urllib.error.HTTPError):
+            def __init__(self):
+                super().__init__("https://api.pexels.com/videos/search", 403, "Forbidden", {}, io.BytesIO(corpo))
+
+            def read(self):
+                return corpo
+
+        with mock.patch("bot_main.urllib.request.urlopen", side_effect=_ErroFake()):
+            with self.assertRaises(RuntimeError) as ctx:
+                self.provider._buscar("saturn rings")
+
+        self.assertNotIn("Cloudflare", str(ctx.exception))
+        self.assertIn("pexels.com/api", str(ctx.exception))
+
+
+def _diretorio_temporario_para_teste(testcase: unittest.TestCase) -> str:
+    import tempfile
+
+    diretorio = tempfile.mkdtemp()
+    testcase.addCleanup(lambda: __import__("shutil").rmtree(diretorio, ignore_errors=True))
+    return diretorio
+
+
+# ===========================================================================
+# 16. TTS: OpenAI 429 insufficient_quota -> Google TTS (sem gastar retries
+#     do OpenAI num erro que não é timeout) — Problema 6 da auditoria
+#     (comportamento já correto; teste de regressão para não quebrar)
+# ===========================================================================
+class TestFallbackTTS(unittest.TestCase):
+    def test_quota_insuficiente_na_openai_passa_direto_para_google_sem_repetir(self):
+        chamadas = {"openai": 0, "google": 0}
+
+        def fake_openai(texto, caminho_saida):
+            chamadas["openai"] += 1
+            raise RuntimeError("Error code: 429 - insufficient_quota")
+
+        def fake_google(texto, caminho_saida):
+            chamadas["google"] += 1
+            return caminho_saida
+
+        with mock.patch(
+            "bot_main._provedores_tts_configurados",
+            return_value=[("OpenAI TTS", fake_openai), ("Google Cloud TTS", fake_google)],
+        ), mock.patch("bot_main.preparar_texto_para_narracao", side_effect=lambda t: t):
+            resultado = bot_main.gerar_audio("um roteiro de teste qualquer.", "saida.mp3")
+
+        self.assertEqual(resultado, "saida.mp3")
+        # 429/insufficient_quota não é timeout: só 1 tentativa na OpenAI,
+        # nunca as 2 permitidas por TTS_TENTATIVAS_POR_PROVEDOR — se
+        # alguém "consertar" isso adicionando retry pra todo erro, este
+        # teste falha.
+        self.assertEqual(chamadas["openai"], 1)
+        self.assertEqual(chamadas["google"], 1)
+
+    def test_timeout_na_openai_tenta_de_novo_antes_de_cair_para_google(self):
+        chamadas = {"openai": 0, "google": 0}
+
+        def fake_openai(texto, caminho_saida):
+            chamadas["openai"] += 1
+            raise TimeoutError("request timed out")
+
+        def fake_google(texto, caminho_saida):
+            chamadas["google"] += 1
+            return caminho_saida
+
+        with mock.patch(
+            "bot_main._provedores_tts_configurados",
+            return_value=[("OpenAI TTS", fake_openai), ("Google Cloud TTS", fake_google)],
+        ), mock.patch("bot_main.preparar_texto_para_narracao", side_effect=lambda t: t), mock.patch(
+            "bot_main.time.sleep"
+        ):
+            bot_main.gerar_audio("um roteiro de teste qualquer.", "saida.mp3")
+
+        self.assertEqual(chamadas["openai"], bot_main.TTS_TENTATIVAS_POR_PROVEDOR)
+        self.assertEqual(chamadas["google"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

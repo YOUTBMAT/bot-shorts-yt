@@ -122,6 +122,23 @@ VIDEO_FUNDO_PATH: str = "fundo.mp4"  # fallback legado: usado só se a bibliotec
 VIDEO_SAIDA_PATH: str = "video_final.mp4"
 VIDEO_WIDTH: int = 1080
 ASPECT_RATIO: float = 9 / 16  # formato vertical (Shorts)
+# Altura EXATA correspondente a VIDEO_WIDTH em 9:16 — usada como alvo fixo
+# (não apenas como resultado "esperado" de um resize proporcional) para
+# forçar TODO segmento de fundo a ter sempre a mesma altura em pixels. Ver
+# `_redimensionar_para_vertical()` e `normalize_frame_size()`: sem isso,
+# `clip.resize(width=VIDEO_WIDTH)` deixa a altura final a cargo do
+# arredondamento interno do MoviePy a partir da altura ORIGINAL de cada
+# vídeo de fundo — que varia de arquivo para arquivo — e diferentes
+# trechos de B-roll (Fase 4) podiam terminar com alturas ligeiramente
+# diferentes (ex.: 1918 vs 1921px) mesmo depois do crop 9:16. Isso não dava
+# erro no crop/resize em si (cada segmento é internamente consistente) —
+# só estourava depois, na composição final, quando um segmento posterior
+# do vídeo concatenado (com sua própria altura) era desenhado sob máscaras/
+# overlays construídos contra o tamanho do PRIMEIRO segmento
+# (`largura_final, altura_final = fundo_com_vinheta.size`), causando
+# exatamente `operands could not be broadcast together with shapes
+# (1921,1080,3) (1918,1080,1)`.
+VIDEO_HEIGHT: int = round(VIDEO_WIDTH / ASPECT_RATIO)
 CROP_OFFSET_MAX_FRACTION: float = 0.35  # quanto do espaço sobrando o corte pode usar p/ não centralizar
 DURACAO_MINIMA_SEGURANCA: float = 0.05  # segundos; piso usado contra timestamps/durações degeneradas
 
@@ -157,6 +174,19 @@ PEXELS_ORIENTACAO: str = "landscape"  # priorizamos 16:9, cortado depois para 9:
 PEXELS_FPS_PREFERIDO: int = 30
 PEXELS_RESOLUCAO_PREFERIDA: Tuple[int, int] = (1920, 1080)
 MIN_WIDTH: int = 1280  # ignora automaticamente vídeos com resolução menor que essa
+# User-Agent "de navegador" enviado em toda requisição ao Pexels (busca E
+# download). O Pexels roda atrás de Cloudflare, e o Cloudflare bloqueia por
+# assinatura de bot (HTTP 403, corpo "error code: 1010") requisições sem um
+# User-Agent — ou com o default do urllib ("Python-urllib/3.x"), que é um
+# dos assinantes mais reconhecidos como automação. A API Key sendo válida
+# não evita esse bloqueio: ele acontece ANTES da chave ser sequer avaliada
+# pela API do Pexels, na camada de Cloudflare. Nenhuma outra informação de
+# identificação é necessária — só um UA que não bata com um cliente HTTP de
+# biblioteca "cru".
+PEXELS_USER_AGENT: str = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
 CACHE_DIR: str = "cache/pexels"
 CACHE_METADATA_PATH: str = "cache/pexels/metadata.json"
 CACHE_TTL_HOURS: float = 24.0  # depois disso, o cache expira e pode baixar de novo
@@ -797,7 +827,17 @@ class PexelsMediaProvider(MediaProvider):
             {"query": query, "per_page": PEXELS_MAX_RESULTS, "orientation": PEXELS_ORIENTACAO}
         )
         url = f"{PEXELS_API_URL}?{parametros}"
-        requisicao = urllib.request.Request(url, headers={"Authorization": self.api_key})
+        requisicao = urllib.request.Request(
+            url,
+            headers={
+                "Authorization": self.api_key,
+                # Sem isso, o Cloudflare na frente do Pexels bloqueia a
+                # requisição com HTTP 403 / "error code: 1010" ANTES mesmo
+                # de a API Key ser avaliada — ver comentário de
+                # `PEXELS_USER_AGENT` acima.
+                "User-Agent": PEXELS_USER_AGENT,
+            },
+        )
 
         try:
             with urllib.request.urlopen(requisicao, timeout=PEXELS_TIMEOUT_SECONDS) as resposta:
@@ -811,6 +851,18 @@ class PexelsMediaProvider(MediaProvider):
                     "da Secret PEXELS_API_KEY no GitHub."
                 ) from err
             if err.code == 403:
+                if "error code: 1010" in corpo_erro.lower():
+                    raise RuntimeError(
+                        f"❌ Pexels: bloqueado pelo Cloudflare (HTTP 403, "
+                        f"'error code: 1010') na busca por '{query}'. Isso é um "
+                        f"bloqueio por assinatura de cliente HTTP/bot, ANTES da "
+                        f"API Key ser avaliada — não costuma indicar chave "
+                        f"inválida nem conta suspensa. Se isso persistir mesmo "
+                        f"com um User-Agent de navegador definido, o IP do "
+                        f"runner (ex.: datacenter do GitHub Actions) pode estar "
+                        f"numa faixa bloqueada pelo Cloudflare do Pexels; nesse "
+                        f"caso não há correção possível só por código."
+                    ) from err
                 raise RuntimeError(
                     f"❌ Pexels: acesso negado (HTTP 403) na busca por '{query}'. "
                     f"Normalmente indica API Key inválida/revogada, conta "
@@ -876,7 +928,11 @@ class PexelsMediaProvider(MediaProvider):
         interrompidos deixarem um `.mp4` corrompido no cache."""
         temporario = destino + ".part"
         try:
-            requisicao = urllib.request.Request(url)
+            # Mesmo User-Agent da busca: os arquivos de vídeo do Pexels são
+            # servidos por um CDN (não necessariamente o mesmo domínio da
+            # API), mas também pode estar atrás de proteção anti-bot — mais
+            # seguro sempre identificar como um navegador aqui também.
+            requisicao = urllib.request.Request(url, headers={"User-Agent": PEXELS_USER_AGENT})
             with urllib.request.urlopen(requisicao, timeout=PEXELS_TIMEOUT_SECONDS) as resposta:
                 with open(temporario, "wb") as arquivo_saida:
                     arquivo_saida.write(resposta.read())
@@ -1971,6 +2027,65 @@ def _escolher_posicao_de_corte(sobra: float) -> float:
     return random.uniform(-deslocamento_max, deslocamento_max)
 
 
+def normalize_frame_size(frame: np.ndarray, altura: int, largura: int) -> np.ndarray:
+    """Garante que um array de frame OU máscara tenha EXATAMENTE
+    `altura` x `largura` pixels, preservando o número de canais de entrada
+    (funciona com grayscale `(H,W)`, máscara `(H,W,1)`, RGB `(H,W,3)` e
+    RGBA `(H,W,4)`).
+
+    Usada como blindagem central contra a classe de bug que causava
+    `operands could not be broadcast together with shapes (1921,1080,3)
+    (1918,1080,1)`: duas peças da composição (ex.: um segmento de B-roll e
+    a máscara/overlay construída para o canvas "oficial") terminando com
+    alturas ligeiramente diferentes por causa de arredondamentos
+    independentes em crops/resizes anteriores.
+
+    Estratégia deliberadamente conservadora — NUNCA distorce (nunca dá
+    resize/stretch) e nunca faz broadcast artificial: quando o array é
+    MAIOR que o alvo em algum eixo, corta o excedente centralizado; quando
+    é MENOR, preenche a borda replicando o pixel mais próximo
+    (`mode="edge"`, sem inventar cor nova nem preto artificial). Isso só é
+    seguro porque a diferença esperada aqui é de arredondamento (poucos
+    pixels) — nunca uma mudança real de proporção; um desvio grande
+    (ex.: dezenas de pixels) é sinal de um bug diferente e mais sério, não
+    algo para este utilitário "corrigir" silenciosamente.
+    """
+    if frame.ndim not in (2, 3):
+        raise ValueError(
+            f"normalize_frame_size: array com {frame.ndim} dimensões não é "
+            f"suportado (esperado 2 = grayscale/máscara ou 3 = RGB/RGBA)."
+        )
+
+    h, w = frame.shape[:2]
+
+    # --- eixo vertical (altura) ---
+    if h > altura:
+        sobra = h - altura
+        y0 = sobra // 2
+        frame = frame[y0 : y0 + altura]
+    elif h < altura:
+        falta = altura - h
+        topo = falta // 2
+        base = falta - topo
+        pad_width = [(topo, base), (0, 0)] + [(0, 0)] * (frame.ndim - 2)
+        frame = np.pad(frame, pad_width, mode="edge")
+
+    # --- eixo horizontal (largura) ---
+    h_atual, w_atual = frame.shape[:2]
+    if w_atual > largura:
+        sobra = w_atual - largura
+        x0 = sobra // 2
+        frame = frame[:, x0 : x0 + largura]
+    elif w_atual < largura:
+        falta = largura - w_atual
+        esquerda = falta // 2
+        direita = falta - esquerda
+        pad_width = [(0, 0), (esquerda, direita)] + [(0, 0)] * (frame.ndim - 2)
+        frame = np.pad(frame, pad_width, mode="edge")
+
+    return frame
+
+
 def _redimensionar_para_vertical(clip: VideoFileClip) -> VideoFileClip:
     """Corta o vídeo de fundo para o formato vertical 9:16 com crop inteligente.
 
@@ -1998,6 +2113,24 @@ def _redimensionar_para_vertical(clip: VideoFileClip) -> VideoFileClip:
     clip = clip.resize(width=VIDEO_WIDTH)
 
     _debug_registrar("03_resize", clip)
+
+    # Blindagem definitiva (Problema 4/5 da auditoria): `clip.resize(width=
+    # VIDEO_WIDTH)` deixa a altura final a cargo do arredondamento interno
+    # do MoviePy a partir da altura ORIGINAL deste vídeo específico — dois
+    # vídeos de fundo diferentes (aspect ratios de origem diferentes) podem
+    # terminar com alturas ligeiramente diferentes (1918 vs 1921px) mesmo
+    # após o mesmo crop 9:16 + resize por largura. Forçamos aqui, de uma
+    # vez por todas, TODO frame emitido por este clip a ter exatamente
+    # VIDEO_WIDTH x VIDEO_HEIGHT — a MESMA função `normalize_frame_size`
+    # usada nos testes de regressão do bug de broadcasting. Isso garante,
+    # por construção, que TODOS os segmentos de B-roll concatenados em
+    # `_montar_fundo_multiplo()` compartilham exatamente o mesmo tamanho de
+    # canvas — a causa raiz do `operands could not be broadcast together`.
+    if clip.size != (VIDEO_WIDTH, VIDEO_HEIGHT):
+        clip = clip.fl_image(lambda frame: normalize_frame_size(frame, VIDEO_HEIGHT, VIDEO_WIDTH))
+        clip.size = (VIDEO_WIDTH, VIDEO_HEIGHT)  # metadado (w, h) do MoviePy — fl_image não o recalcula sozinho
+
+    _debug_registrar("03b_normalizado", clip)
 
     return clip
 
@@ -2987,21 +3120,31 @@ def criar_video(
         largura_final, altura_final = fundo_com_vinheta.size
         _debug_registrar("06_vinheta", fundo_com_vinheta)
 
-        # Verificação estrutural (custo de 1 frame, desprezível perto do
-        # render inteiro): confirma que o fundo realmente preenche 100% do
-        # canvas antes de prosseguir. Isso não "esconde" um eventual bug de
-        # faixa preta — pelo contrário, faz a renderização falhar alto e
-        # claro, com a causa exata, em vez de produzir silenciosamente um
-        # vídeo com borda preta que só seria percebido ao assistir.
-        _frame_teste = fundo_com_vinheta.get_frame(min(0.5, duracao_final / 2))
-        _altura_real, _largura_real = _frame_teste.shape[:2]
-        if (_largura_real, _altura_real) != (largura_final, altura_final):
-            raise RuntimeError(
-                f"❌ Inconsistência de tamanho no fundo do vídeo: o frame renderizado "
-                f"tem {_largura_real}x{_altura_real}px, mas o canvas esperado é "
-                f"{largura_final}x{altura_final}px. Isso indicaria uma regressão no "
-                f"Ken Burns/vinheta — pare e investigue antes de publicar."
-            )
+        # Verificação estrutural (custo de alguns frames — 1 por trecho de
+        # B-roll —, desprezível perto do render inteiro): confirma que o
+        # fundo realmente preenche 100% do canvas em CADA trecho, não só no
+        # meio do vídeo. Isso não "esconde" um eventual bug de tamanho —
+        # pelo contrário, faz a renderização falhar alto e claro, com a
+        # causa e o trecho exatos, em vez de estourar minutos depois dentro
+        # de `write_videofile()` com um `operands could not be broadcast
+        # together` genérico (a causa raiz encontrada na auditoria: um
+        # único ponto de amostragem no meio do vídeo só cobria o PRIMEIRO
+        # trecho de B-roll, deixando inconsistências em trechos
+        # posteriores passarem despercebidas até o render de verdade).
+        for _indice_seg, (_inicio_seg, _fim_seg) in enumerate(segmentos):
+            _t_amostra = min((_inicio_seg + _fim_seg) / 2, duracao_final - 0.01)
+            _t_amostra = max(0.0, _t_amostra)
+            _frame_teste = fundo_com_vinheta.get_frame(_t_amostra)
+            _altura_real, _largura_real = _frame_teste.shape[:2]
+            if (_largura_real, _altura_real) != (largura_final, altura_final):
+                raise RuntimeError(
+                    f"❌ Inconsistência de tamanho no fundo do vídeo: o trecho de "
+                    f"B-roll {_indice_seg + 1}/{len(segmentos)} (t={_t_amostra:.2f}s) "
+                    f"tem {_largura_real}x{_altura_real}px, mas o canvas esperado é "
+                    f"{largura_final}x{altura_final}px. Isso indicaria uma regressão "
+                    f"em `_redimensionar_para_vertical()`/`_aplicar_ken_burns()` — "
+                    f"pare e investigue antes de publicar."
+                )
 
         text_clips = _criar_clips_de_legenda(grupos, largura_final, altura_final)
         clips_para_fechar.extend(text_clips)
