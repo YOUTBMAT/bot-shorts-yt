@@ -125,12 +125,22 @@ ASPECT_RATIO: float = 9 / 16  # formato vertical (Shorts)
 CROP_OFFSET_MAX_FRACTION: float = 0.35  # quanto do espaço sobrando o corte pode usar p/ não centralizar
 DURACAO_MINIMA_SEGURANCA: float = 0.05  # segundos; piso usado contra timestamps/durações degeneradas
 
+# --- Múltiplos B-rolls por vídeo (Fase 4) ---
+# Em vez de um único fundo do início ao fim, o Short é dividido em trechos
+# e cada trecho usa um vídeo de fundo diferente (com seu próprio Ken
+# Burns) — ver `_definir_segmentos_broll()` / `_montar_fundo_multiplo()`.
+BROLL_SEGMENTO_DURACAO_ALVO: float = 6.0  # segundos; duração alvo de cada trecho de B-roll
+BROLL_SEGMENTO_DURACAO_MINIMA: float = 3.0  # segundos; nunca fecha um trecho final menor que isso sozinho
+BROLL_MAX_SEGMENTOS: int = 6  # teto de trechos por vídeo (também o nº de candidatos pedidos ao MediaManager)
+BROLL_MAX_TENTATIVAS_POR_SEGMENTO: int = 2  # candidatos alternativos testados por trecho antes de reaproveitar o último que funcionou
+
 # --- Biblioteca de mídia (MediaManager) ---
 MEDIA_VIDEOS_DIR: str = "assets/videos"  # pode ter subpastas por tema (minecraft/, parkour/, ...)
 MEDIA_IMAGENS_DIR: str = "assets/imagens"
 MEDIA_EXTENSOES_VIDEO = {".mp4", ".mov", ".mkv", ".webm"}
 MEDIA_EXTENSOES_IMAGEM = {".jpg", ".jpeg", ".png", ".webp"}
 MEDIA_VIDEO_DURACAO_MINIMA: float = 5.0  # segundos; vídeos mais curtos são ignorados
+MEDIA_RESOLUCAO_MINIMA_MENOR_LADO: int = 480  # px; ignora vídeos com o menor lado (largura OU altura) abaixo disso
 MEDIA_HISTORICO_PATH: str = "media_history.json"  # últimas mídias usadas, para não repetir
 MEDIA_HISTORICO_TAMANHO: int = 10  # quantos últimos usados guardar/evitar repetir
 MEDIA_MAX_TENTATIVAS: int = 3  # quantos arquivos diferentes tentar antes de desistir
@@ -281,6 +291,99 @@ STOPWORDS_PESQUISA = PALAVRAS_INSEPARAVEIS | {
     "aquelas", "haver", "fazer", "fez", "fazem",
 }
 
+# Palavras adicionais, além de STOPWORDS_PESQUISA, ignoradas SÓ na geração
+# de queries visuais do Pexels (Fase 3): quantidades, comparativos e
+# unidades. Gramaticalmente são substantivos/adjetivos válidos (por isso
+# não entram em STOPWORDS_PESQUISA, usada também para outros fins), mas
+# não têm nenhum valor de busca visual — "anos", "milhoes", "maior" não
+# correspondem a nenhuma imagem/vídeo de estoque específico. Comparação
+# sempre feita com a palavra já normalizada (sem acento, minúscula).
+PEXELS_PALAVRAS_ABSTRATAS = {
+    "ano", "anos", "vez", "vezes", "bilhao", "bilhoes", "milhao", "milhoes",
+    "mil", "recorde", "maior", "menor", "melhor", "pior", "primeiro",
+    "primeira", "ultimo", "ultima", "gigante", "minusculo", "enorme",
+    "imenso", "pequeno", "grande", "metro", "metros", "quilometro",
+    "quilometros", "centimetro", "centimetros", "quilo", "quilos", "grama",
+    "gramas", "tonelada", "toneladas", "grau", "graus", "porcento",
+    "percentual", "segundo", "segundos", "minuto", "minutos", "hora",
+    "horas", "dia", "dias", "mes", "meses", "seculo", "seculos", "vezes",
+}
+
+# Dicionário PT -> lista de queries visuais em inglês (Fase 3): usado por
+# `_gerar_queries_visuais()` (seção 0, PexelsMediaProvider) para converter
+# palavras do roteiro em buscas que realmente retornam imagens relevantes
+# no Pexels — em vez da palavra isolada em português (que, sozinha, é
+# ambígua ou pouco pesquisada no banco: "aneis", "saturno" sozinhos
+# retornam muito menos/pior que "saturn rings"). Cada entrada tem de 2 a 4
+# variações para dar diversidade de material entre B-rolls do mesmo tema.
+# Deliberadamente uma heurística por dicionário (sem IA/embeddings) — fora
+# de escopo desta fase, e desnecessário para o resultado pedido.
+TERMOS_VISUAIS_PT_EN: Dict[str, List[str]] = {
+    # Espaço / astronomia
+    "saturno": ["saturn planet", "saturn rings", "planet rings", "solar system"],
+    "jupiter": ["jupiter planet", "gas giant planet", "solar system"],
+    "marte": ["mars planet", "red planet", "mars surface"],
+    "lua": ["moon surface", "full moon", "moon night sky"],
+    "sol": ["sun solar flare", "sunrise sky", "sun close up"],
+    "terra": ["planet earth space", "earth from space"],
+    "estrela": ["stars night sky", "starry sky"],
+    "estrelas": ["stars night sky", "starry sky", "galaxy stars"],
+    "galaxia": ["galaxy space", "milky way night sky"],
+    "universo": ["universe space", "deep space stars", "galaxy space"],
+    "planeta": ["planet space", "solar system planet"],
+    "asteroide": ["asteroid space", "asteroid field"],
+    "cometa": ["comet space", "comet night sky"],
+    "buraco": ["black hole space", "space vortex"],
+    "foguete": ["rocket launch", "space rocket"],
+    "astronauta": ["astronaut space", "astronaut spacewalk"],
+    "satelite": ["satellite space", "satellite orbit earth"],
+    "nasa": ["nasa space", "space exploration"],
+    "gravidade": ["zero gravity space", "gravity space"],
+    # Oceano / vida marinha
+    "oceano": ["ocean underwater", "deep ocean", "ocean waves aerial"],
+    "mar": ["sea waves", "ocean sea aerial"],
+    "baleia": ["blue whale", "whale underwater", "ocean whale", "marine life"],
+    "tubarao": ["shark underwater", "shark ocean"],
+    "golfinho": ["dolphin underwater", "dolphin ocean"],
+    "polvo": ["octopus underwater", "octopus ocean"],
+    "recife": ["coral reef underwater", "coral reef ocean"],
+    # Natureza / geografia
+    "floresta": ["forest aerial", "forest trees", "rainforest"],
+    "deserto": ["desert dunes", "desert landscape"],
+    "montanha": ["mountain landscape", "mountain range aerial"],
+    "vulcao": ["volcano eruption", "volcano lava"],
+    "gelo": ["ice glacier", "ice landscape"],
+    "glaciar": ["glacier ice", "glacier landscape aerial"],
+    "terremoto": ["earthquake damage", "seismic disaster"],
+    "tempestade": ["storm clouds", "thunderstorm lightning"],
+    "relampago": ["lightning storm", "lightning strike sky"],
+    "furacao": ["hurricane satellite", "storm clouds aerial"],
+    "cachoeira": ["waterfall nature", "waterfall aerial"],
+    # Ciência / corpo humano
+    "dna": ["dna strand", "dna helix science"],
+    "celula": ["human cell microscope", "cell biology animation"],
+    "cerebro": ["human brain", "brain science"],
+    "coracao": ["human heart", "heartbeat medical"],
+    "atomo": ["atom science", "atom particle animation"],
+    "molecula": ["molecule science", "chemistry molecule"],
+    "virus": ["virus microscope", "virus cell"],
+    "bacteria": ["bacteria microscope", "bacteria cell"],
+    # Animais terrestres / dinossauros
+    "dinossauro": ["dinosaur fossil", "dinosaur animation"],
+    "leao": ["lion wildlife", "lion savanna"],
+    "elefante": ["elephant wildlife", "elephant savanna"],
+    "tigre": ["tiger wildlife", "tiger jungle"],
+    "urso": ["bear wildlife", "bear forest"],
+    "aranha": ["spider macro", "spider web"],
+    "formiga": ["ant macro", "ant colony"],
+    "abelha": ["bee macro", "bee flower"],
+    # Tecnologia
+    "robo": ["robot technology", "robotics"],
+    "inteligencia": ["artificial intelligence technology", "ai technology"],
+    "computador": ["computer technology", "computer chip"],
+    "internet": ["internet network technology", "data network"],
+}
+
 
 
 
@@ -337,15 +440,37 @@ class MediaProvider(ABC):
 
 def _validar_arquivo_video(caminho: str) -> bool:
     """Validação completa de um arquivo de vídeo, compartilhada por todos
-    os MediaProviders: consegue abrir e tem pelo menos
-    MEDIA_VIDEO_DURACAO_MINIMA segundos. Extraída como função solta (em
-    vez de método duplicado em cada provider) porque a lógica é idêntica
-    independente de o arquivo ter vindo do disco local ou de um download
-    do Pexels — só muda de onde o arquivo chegou até aqui."""
+    os MediaProviders (Fase 5): existe, abre de verdade, tem duração
+    mínima, tem resolução adequada e consegue decodificar pelo menos um
+    frame de verdade (não só ler os metadados do header). Extraída como
+    função solta (em vez de método duplicado em cada provider) porque a
+    lógica é idêntica independente de o arquivo ter vindo do disco local
+    ou de um download do Pexels — só muda de onde o arquivo chegou até
+    aqui.
+
+    Qualquer falha aqui (arquivo ausente, corrompido, curto demais,
+    pequeno demais ou sem frames decodificáveis) faz o candidato ser
+    descartado pelo `MediaManager` SEM entrar no histórico — ver
+    `MediaManager._escolher_de()`."""
+    if not os.path.exists(caminho) or os.path.getsize(caminho) <= 0:
+        return False
+
     clip = None
     try:
         clip = VideoFileClip(caminho)
-        return bool(clip.duration and clip.duration >= MEDIA_VIDEO_DURACAO_MINIMA)
+
+        if not clip.duration or clip.duration < MEDIA_VIDEO_DURACAO_MINIMA:
+            return False
+
+        largura, altura = clip.size
+        if not largura or not altura or min(largura, altura) < MEDIA_RESOLUCAO_MINIMA_MENOR_LADO:
+            return False
+
+        # "possui frames válidos": força a decodificação de verdade de um
+        # frame (não só a leitura dos metadados do header, que podem estar
+        # ok mesmo num arquivo com payload corrompido/truncado).
+        clip.get_frame(min(0.1, clip.duration / 2))
+        return True
     except Exception:
         return False
     finally:
@@ -480,6 +605,14 @@ class PexelsMediaProvider(MediaProvider):
         self.metadata_path = metadata_path
         os.makedirs(self.cache_dir, exist_ok=True)
         self._metadata: Dict[str, dict] = self._carregar_metadata()
+        # Diagnóstico seguro (Fase 2): confirma que a Secret chegou até
+        # aqui e informa só o TAMANHO dela — nunca o valor. Ajuda a
+        # distinguir rapidamente "a key nem chegou no ambiente" de "a key
+        # chegou mas foi rejeitada pela API" só olhando o log.
+        print(
+            f"🔑 Pexels: API key presente (comprimento: {len(self.api_key) if self.api_key else 0} "
+            f"caracteres)."
+        )
         # Blacklist em memória, válida só para esta execução (não é
         # persistida): guarda os IDs de vídeos descartados por
         # `descartar()` (ex.: passaram na validação mas falharam de
@@ -532,46 +665,187 @@ class PexelsMediaProvider(MediaProvider):
                 )
         return validos
 
-    # --- palavras-chave -------------------------------------------------
-    def _extrair_palavras_chave(self, roteiro: str) -> List[str]:
-        """Extrai até MAX_PALAVRAS_CHAVE_PESQUISA palavras-chave do
-        roteiro por frequência simples, ignorando STOPWORDS_PESQUISA e
-        palavras curtas demais. Deliberadamente NÃO usa IA/embeddings para
-        isso (fora de escopo desta fase) — é uma heurística leve, sem
-        dependência nova, que já é suficiente para gerar termos de busca
-        razoáveis a partir de um roteiro em português."""
+    # --- queries visuais (Fase 3) -----------------------------------------
+    def _gerar_queries_visuais(self, roteiro: str) -> List[str]:
+        """Gera até MAX_PALAVRAS_CHAVE_PESQUISA queries de busca VISUAIS a
+        partir do roteiro — não apenas as palavras mais frequentes.
+
+        Diferença para a extração antiga (por frequência simples): aqui,
+        cada palavra do roteiro que bate com `TERMOS_VISUAIS_PT_EN` vira
+        uma ou mais queries em INGLÊS já testadas para descrever bem a
+        entidade visualmente (ex.: "saturno" -> "saturn rings", não
+        "saturno" sozinho) — inglês retorna consistentemente mais e
+        melhores resultados no Pexels que termos avulsos em português.
+        Números, unidades, comparativos e outras palavras sem valor visual
+        (`PEXELS_PALAVRAS_ABSTRATAS`) são sempre ignorados, mesmo que sejam
+        frequentes no roteiro (é exatamente o caso de "anos"/"milhoes" no
+        exemplo que motivou esta fase).
+
+        Palavras SEM entrada no dicionário mas que sobrevivem aos filtros
+        (não são stopword/abstrata/curta) ainda entram como fallback — em
+        português mesmo, mantendo pelo menos alguma chance de retorno —
+        mas só depois de esgotadas as correspondências do dicionário, e
+        nunca sozinhas se puderem ser evitadas (ver `MAX_PALAVRAS_CHAVE_PESQUISA`
+        cortando o total).
+
+        Deliberadamente uma heurística por dicionário/frequência, sem
+        IA/embeddings — fora de escopo desta fase e desnecessário para o
+        resultado pedido.
+        """
         contagem: Dict[str, int] = {}
+        ordem_primeira_ocorrencia: List[str] = []
         for palavra in re.findall(r"[A-Za-zÀ-ÿ]+", roteiro):
             normalizada = _normalizar_palavra(palavra)
-            if len(normalizada) < PEXELS_MIN_PALAVRA_LEN or normalizada in STOPWORDS_PESQUISA:
+            if (
+                len(normalizada) < PEXELS_MIN_PALAVRA_LEN
+                or normalizada in STOPWORDS_PESQUISA
+                or normalizada in PEXELS_PALAVRAS_ABSTRATAS
+            ):
                 continue
+            if normalizada not in contagem:
+                ordem_primeira_ocorrencia.append(normalizada)
             contagem[normalizada] = contagem.get(normalizada, 0) + 1
 
-        ordenadas = sorted(contagem.items(), key=lambda par: (-par[1], par[0]))
-        palavras = [palavra for palavra, _freq in ordenadas[:MAX_PALAVRAS_CHAVE_PESQUISA]]
-        return palavras or ["nature"]  # fallback genérico se o roteiro não render nenhum termo válido
+        # Ordena por frequência (desc) e, em empate, pela ordem de
+        # primeira aparição no roteiro — mais estável e previsível que
+        # ordem alfabética pura para um texto curto de Short.
+        palavras_ordenadas = sorted(
+            contagem.keys(),
+            key=lambda p: (-contagem[p], ordem_primeira_ocorrencia.index(p)),
+        )
+
+        queries: List[str] = []
+        vistas: set = set()
+
+        def _adicionar(query: str) -> None:
+            if query not in vistas and len(queries) < MAX_PALAVRAS_CHAVE_PESQUISA:
+                vistas.add(query)
+                queries.append(query)
+
+        # 1ª passada: prioriza palavras com correspondência no dicionário
+        # visual (substantivos/entidades concretas conhecidas).
+        for palavra in palavras_ordenadas:
+            if len(queries) >= MAX_PALAVRAS_CHAVE_PESQUISA:
+                break
+            for query_visual in TERMOS_VISUAIS_PT_EN.get(palavra, []):
+                _adicionar(query_visual)
+
+        # 2ª passada: só se ainda houver espaço, completa com as palavras
+        # em português que sobreviveram aos filtros mas não têm entrada no
+        # dicionário — melhor que nada, mesmo não sendo inglês.
+        for palavra in palavras_ordenadas:
+            if len(queries) >= MAX_PALAVRAS_CHAVE_PESQUISA:
+                break
+            if palavra in TERMOS_VISUAIS_PT_EN:
+                continue  # já contribuiu na 1ª passada
+            _adicionar(palavra)
+
+        return queries or ["nature landscape"]  # fallback genérico se o roteiro não render nenhum termo válido
 
     # --- busca / download ---------------------------------------------------
+    def _ler_corpo_erro(self, err: "urllib.error.HTTPError") -> str:
+        """Lê o corpo de uma resposta de erro HTTP com segurança (nunca
+        levanta exceção — usado só para diagnóstico)."""
+        try:
+            bruto = err.read()
+            return bruto.decode("utf-8", errors="replace") if bruto else ""
+        except Exception:
+            return ""
+
+    def _sanitizar_corpo_erro(self, corpo: str, tamanho_max: int = 300) -> str:
+        """Trunca e remove QUALQUER ocorrência da API key do corpo de erro
+        antes de logar (defesa extra: mesmo que um proxy/CDN ecoasse a URL
+        completa de volta no corpo, a key nunca vai parar no log)."""
+        if not corpo:
+            return "(corpo vazio)"
+        sanitizado = corpo.replace(self.api_key, "***") if self.api_key else corpo
+        sanitizado = " ".join(sanitizado.split())  # colapsa quebras de linha/espaços em excesso
+        if len(sanitizado) > tamanho_max:
+            sanitizado = sanitizado[:tamanho_max] + "…"
+        return sanitizado
+
+    def _log_diagnostico_erro(self, query: str, status: int, corpo_erro: str) -> None:
+        """Log de diagnóstico seguro para falhas do Pexels (Fase 2): NUNCA
+        imprime a API key nem qualquer header — só metadados úteis para
+        depuração (presença/tamanho da key, endpoint, método, status HTTP
+        e um corpo de erro sanitizado)."""
+        print(
+            f"🔎 Pexels diagnóstico: query='{query}' metodo=GET endpoint={PEXELS_API_URL} "
+            f"status={status} chave_presente={bool(self.api_key)} "
+            f"chave_tamanho={len(self.api_key) if self.api_key else 0} "
+            f"corpo={self._sanitizar_corpo_erro(corpo_erro)}"
+        )
+
     def _buscar(self, query: str) -> List[dict]:
-        """Consulta a API oficial do Pexels. Erros de rede/HTTP viram
-        RuntimeError com prefixo "❌ Pexels: ..." — capturados por
-        `listar_videos()`, que segue para a próxima palavra-chave em vez
-        de interromper a busca inteira por causa de uma falha pontual."""
+        """Consulta a API oficial do Pexels (GET /videos/search com header
+        `Authorization: <key>`, sem prefixo "Bearer" — formato exigido pela
+        API do Pexels). Erros de rede/HTTP/JSON viram RuntimeError com
+        prefixo "❌ Pexels: ..." — capturados por `listar_videos()`, que
+        segue para a próxima query em vez de interromper a busca inteira
+        por causa de uma falha pontual (Fase 8: o pipeline nunca quebra só
+        por causa do Pexels).
+
+        Trata separadamente 401 (key inválida), 403 (acesso negado — key
+        revogada/conta suspensa/plano insuficiente, não é rede), 429
+        (limite de requisições excedido), 5xx (erro do lado do Pexels,
+        provavelmente temporário), timeout/indisponibilidade de rede, e
+        resposta com JSON inválido — cada caso com uma mensagem específica
+        que já aponta a causa mais provável, em vez de um "falhou (HTTP
+        xxx)" genérico para tudo.
+        """
         parametros = urllib.parse.urlencode(
             {"query": query, "per_page": PEXELS_MAX_RESULTS, "orientation": PEXELS_ORIENTACAO}
         )
         url = f"{PEXELS_API_URL}?{parametros}"
         requisicao = urllib.request.Request(url, headers={"Authorization": self.api_key})
+
         try:
             with urllib.request.urlopen(requisicao, timeout=PEXELS_TIMEOUT_SECONDS) as resposta:
-                dados = json.loads(resposta.read().decode("utf-8"))
-            return dados.get("videos", [])
+                corpo_bruto = resposta.read().decode("utf-8")
         except urllib.error.HTTPError as err:
+            corpo_erro = self._ler_corpo_erro(err)
+            self._log_diagnostico_erro(query, err.code, corpo_erro)
             if err.code == 401:
-                raise RuntimeError("❌ Pexels: API Key inválida (HTTP 401).") from err
+                raise RuntimeError(
+                    "❌ Pexels: API Key inválida (HTTP 401). Confirme o valor "
+                    "da Secret PEXELS_API_KEY no GitHub."
+                ) from err
+            if err.code == 403:
+                raise RuntimeError(
+                    f"❌ Pexels: acesso negado (HTTP 403) na busca por '{query}'. "
+                    f"Normalmente indica API Key inválida/revogada, conta "
+                    f"suspensa ou sem plano ativo — não costuma ser um problema "
+                    f"de rede. Confirme a Secret e o status da conta em "
+                    f"pexels.com/api."
+                ) from err
+            if err.code == 429:
+                raise RuntimeError(
+                    f"❌ Pexels: limite de requisições excedido (HTTP 429) na "
+                    f"busca por '{query}'. A cota da API (mensal/por hora) foi "
+                    f"atingida."
+                ) from err
+            if 500 <= err.code < 600:
+                raise RuntimeError(
+                    f"❌ Pexels: erro no servidor do Pexels (HTTP {err.code}) na "
+                    f"busca por '{query}'; provavelmente temporário."
+                ) from err
             raise RuntimeError(f"❌ Pexels: busca por '{query}' falhou (HTTP {err.code}).") from err
         except (urllib.error.URLError, socket.timeout) as err:
             raise RuntimeError(f"❌ Pexels: indisponível/timeout na busca por '{query}' ({err}).") from err
+
+        try:
+            dados = json.loads(corpo_bruto)
+        except json.JSONDecodeError as err:
+            raise RuntimeError(
+                f"❌ Pexels: resposta JSON inválida na busca por '{query}' ({err})."
+            ) from err
+
+        if not isinstance(dados, dict):
+            raise RuntimeError(
+                f"❌ Pexels: resposta inesperada (não é um objeto JSON) na busca por '{query}'."
+            )
+
+        return dados.get("videos", [])
 
     def _escolher_arquivo(self, video: dict) -> Optional[dict]:
         """Entre os `video_files` de um resultado do Pexels, escolhe o que
@@ -624,7 +898,7 @@ class PexelsMediaProvider(MediaProvider):
         """Fluxo: reaproveita cache válido primeiro (evita gastar
         quota/banda à toa); só busca/baixa mais se ainda faltar para
         `PEXELS_MIN_DOWNLOADS_DESEJADOS`. `contexto` é o roteiro — sem ele
-        não há como gerar palavras-chave, então devolve só o que já está
+        não há como gerar queries visuais, então devolve só o que já está
         em cache (podendo ser uma lista vazia, o que faz o MediaManager
         cair para o fallback local)."""
         em_cache = self._videos_em_cache_validos()
@@ -634,14 +908,14 @@ class PexelsMediaProvider(MediaProvider):
         if not contexto:
             return em_cache
 
-        palavras_chave = self._extrair_palavras_chave(contexto)
+        queries = self._gerar_queries_visuais(contexto)
         novos: List[MediaItem] = []
 
-        for palavra in palavras_chave:
+        for query in queries:
             if len(em_cache) + len(novos) >= PEXELS_MAX_DOWNLOADS:
                 break
             try:
-                resultados = self._buscar(palavra)
+                resultados = self._buscar(query)
             except RuntimeError as err:
                 print(f"⚠️ {err}")
                 continue
@@ -671,9 +945,9 @@ class PexelsMediaProvider(MediaProvider):
                 self._metadata[video_id] = {
                     "caminho": destino,
                     "baixado_em": time.time(),
-                    "palavra_chave": palavra,
+                    "query": query,
                 }
-                novos.append(MediaItem(caminho=destino, categoria=f"pexels/{palavra}", tipo="video"))
+                novos.append(MediaItem(caminho=destino, categoria=f"pexels/{query}", tipo="video"))
 
         if novos:
             self._salvar_metadata()
@@ -816,10 +1090,86 @@ class MediaManager:
             )
             return self._escolher_de(self.provider_fallback, contexto)
 
-    def _escolher_de(self, provider: MediaProvider, contexto: Optional[str]) -> str:
+    def escolher_videos(self, contexto: Optional[str], quantidade: int) -> List[str]:
+        """Como `escolher_video()`, mas devolve até `quantidade` caminhos
+        (usado pelos múltiplos B-rolls de um mesmo Short — Fase 4; ver
+        `escolher_fundo_e_criar_video()`).
+
+        Prioriza SEMPRE um vídeo ainda não escolhido nesta mesma chamada,
+        tentando primeiro o provider primário e, se ele não render nada
+        inédito (esgotado ou indisponível), o fallback — só repete um
+        caminho já escolhido nesta chamada quando NENHUM dos dois
+        providers tem mais nada de novo a oferecer (reutilizar é o último
+        recurso, nunca o primeiro). Nunca levanta exceção se já conseguiu
+        pelo menos 1 vídeo válido; só levanta se não conseguir nenhum."""
+        escolhidos: List[str] = []
+        primario_disponivel = True
+
+        for _ in range(max(1, quantidade)):
+            ja_escolhidos = set(escolhidos)
+            candidato: Optional[str] = None
+            candidato_repetido: Optional[str] = None
+
+            if primario_disponivel:
+                try:
+                    obtido = self._escolher_de(self.provider, contexto, excluir=ja_escolhidos)
+                except Exception as err:
+                    primario_disponivel = False
+                    nome_fallback = (
+                        type(self.provider_fallback).__name__ if self.provider_fallback else "nenhum fallback"
+                    )
+                    print(
+                        f"⚠️ Provedor de mídia primário ({type(self.provider).__name__}) falhou "
+                        f"({err}); usando {nome_fallback} para os B-rolls restantes."
+                    )
+                else:
+                    if obtido in ja_escolhidos:
+                        # Só repetição disponível no primário: guarda como
+                        # última alternativa e tenta achar algo inédito no
+                        # fallback antes de aceitar a repetição.
+                        candidato_repetido = obtido
+                    else:
+                        candidato = obtido
+
+            if candidato is None and self.provider_fallback is not None and self.provider_fallback is not self.provider:
+                try:
+                    obtido = self._escolher_de(self.provider_fallback, contexto, excluir=ja_escolhidos)
+                except Exception:
+                    obtido = None
+                if obtido is not None:
+                    if obtido in ja_escolhidos:
+                        candidato_repetido = candidato_repetido or obtido
+                    else:
+                        candidato = obtido
+
+            if candidato is None:
+                candidato = candidato_repetido  # nada inédito em lugar nenhum; reaproveita
+
+            if candidato is None:
+                if escolhidos:
+                    break  # já temos ao menos 1 vídeo válido; segue com o que tem
+                raise RuntimeError("Nenhum provedor de mídia retornou vídeos válidos para os B-rolls.")
+
+            escolhidos.append(candidato)
+
+        return escolhidos
+
+    def _escolher_de(
+        self, provider: MediaProvider, contexto: Optional[str], excluir: Optional[set] = None
+    ) -> str:
         candidatos = list(provider.listar_videos(contexto))
         if not candidatos:
             raise RuntimeError(f"{type(provider).__name__} não retornou nenhum vídeo candidato.")
+
+        if excluir:
+            inedito = [item for item in candidatos if item.caminho not in excluir]
+            if inedito:
+                # Só restringe à lista inédita se sobrar algo — se TODOS os
+                # candidatos já foram escolhidos antes nesta mesma
+                # chamada, é preferível reaproveitar um deles (Fase 4:
+                # "reutilizar vídeos somente quando necessário") a travar
+                # o pipeline por falta de mídia inédita.
+                candidatos = inedito
 
         random.shuffle(candidatos)
         no_historico = set(self._historico)
@@ -2339,35 +2689,251 @@ def _verificar_fundo_saudavel(clip: VideoFileClip, caminho: str, fracao_preta_ma
         )
 
 
+def _reagrupar_ate_teto(
+    segmentos: List[Tuple[float, float]], teto: int
+) -> List[Tuple[float, float]]:
+    """Funde segmentos adjacentes (sempre preservando os limites originais
+    — nunca corta no meio de um grupo de legenda) até que a quantidade
+    total não ultrapasse `teto`. A cada rodada, funde o par adjacente de
+    MENOR duração somada, para manter o ritmo de corte o mais equilibrado
+    possível em vez de sempre fundir do mesmo lado."""
+    segmentos = list(segmentos)
+    while len(segmentos) > teto and len(segmentos) > 1:
+        menor_indice, menor_soma = 0, float("inf")
+        for indice in range(len(segmentos) - 1):
+            soma = (segmentos[indice][1] - segmentos[indice][0]) + (
+                segmentos[indice + 1][1] - segmentos[indice + 1][0]
+            )
+            if soma < menor_soma:
+                menor_indice, menor_soma = indice, soma
+        inicio = segmentos[menor_indice][0]
+        fim = segmentos[menor_indice + 1][1]
+        segmentos[menor_indice : menor_indice + 2] = [(inicio, fim)]
+    return segmentos
+
+
+def _definir_segmentos_broll(
+    pontos_de_corte: List[float], duracao_total: float
+) -> List[Tuple[float, float]]:
+    """Define os intervalos `[inicio, fim)` de cada trecho de B-roll
+    (Fase 4), usando como limites candidatos os MESMOS pontos onde a
+    legenda já troca de grupo (`pontos_de_corte`, vindos de
+    `agrupar_palavras_em_blocos()`) — assim a troca de vídeo de fundo
+    nunca acontece no meio de uma legenda em exibição, sempre exatamente
+    onde ela também troca. Os cortes são baseados nos segmentos da
+    narração, não em palavras isoladas.
+
+    Agrupa vários limites consecutivos em cada trecho até se aproximar de
+    `BROLL_SEGMENTO_DURACAO_ALVO` segundos, nunca deixando um trecho FINAL
+    menor que `BROLL_SEGMENTO_DURACAO_MINIMA` sozinho (funde com o
+    anterior nesse caso). Se, mesmo assim, sobrarem mais trechos que
+    `BROLL_MAX_SEGMENTOS`, funde os pares adjacentes mais curtos até caber
+    no teto — sempre preservando os limites de legenda originais.
+    """
+    limites = sorted(set([0.0, duracao_total] + [t for t in pontos_de_corte if 0 < t < duracao_total]))
+    if len(limites) <= 1:
+        return [(0.0, duracao_total)]
+
+    segmentos: List[Tuple[float, float]] = []
+    inicio_atual = limites[0]
+    for limite in limites[1:]:
+        duracao_acumulada = limite - inicio_atual
+        eh_ultimo_limite = limite == limites[-1]
+        if duracao_acumulada >= BROLL_SEGMENTO_DURACAO_ALVO or eh_ultimo_limite:
+            segmentos.append((inicio_atual, limite))
+            inicio_atual = limite
+
+    # Funde um último trecho remanescente curto demais com o anterior, em
+    # vez de deixar um B-roll quase instantâneo no fim do vídeo.
+    if len(segmentos) >= 2:
+        inicio_ultimo, fim_ultimo = segmentos[-1]
+        if fim_ultimo - inicio_ultimo < BROLL_SEGMENTO_DURACAO_MINIMA:
+            inicio_penultimo, _fim_penultimo = segmentos[-2]
+            segmentos[-2] = (inicio_penultimo, fim_ultimo)
+            segmentos.pop()
+
+    if len(segmentos) > BROLL_MAX_SEGMENTOS:
+        segmentos = _reagrupar_ate_teto(segmentos, BROLL_MAX_SEGMENTOS)
+
+    return segmentos
+
+
+def _preparar_clip_de_fundo(
+    caminho: str, duracao_alvo: float, clips_para_fechar: List
+) -> VideoFileClip:
+    """Abre um único vídeo de fundo e o prepara para entrar num trecho de
+    B-roll: valida existência/abertura, dá loop se for mais curto que
+    `duracao_alvo`, corta para exatamente essa duração e redimensiona para
+    9:16. Lança `FundoInvalidoError` (nunca deixa uma exceção "crua" do
+    MoviePy escapar) para qualquer arquivo ausente/corrompido/com duração
+    inválida — o chamador (`_montar_fundo_multiplo`) decide o que fazer:
+    descartar e tentar outro candidato para o mesmo trecho."""
+    if not os.path.exists(caminho):
+        raise FundoInvalidoError(f"❌ Vídeo de fundo '{caminho}' não encontrado.")
+    try:
+        clip = VideoFileClip(caminho)
+    except Exception as err:
+        raise FundoInvalidoError(f"❌ Vídeo de fundo '{caminho}' corrompido ou ilegível: {err}") from err
+    clips_para_fechar.append(clip)
+
+    if not clip.duration or clip.duration <= 0:
+        raise FundoInvalidoError(f"❌ Vídeo de fundo '{caminho}' com duração inválida.")
+
+    _verificar_fundo_saudavel(clip, caminho)
+
+    if clip.duration < duracao_alvo:
+        num_loops = math.ceil(duracao_alvo / clip.duration)
+        clip_loop = concatenate_videoclips([clip] * num_loops)
+        clips_para_fechar.append(clip_loop)
+        clip = clip_loop
+
+    clip = clip.subclip(0, duracao_alvo)
+    clip = _redimensionar_para_vertical(clip)
+    return clip
+
+
+def _montar_fundo_multiplo(
+    segmentos: List[Tuple[float, float]],
+    caminhos_disponiveis: List[str],
+    grupos: List[List["PalavraLegenda"]],
+    clips_para_fechar: List,
+    media_manager: Optional["MediaManager"],
+) -> Tuple[VideoClip, List[str]]:
+    """Monta o fundo dinâmico do vídeo concatenando um B-roll DIFERENTE por
+    trecho (Fase 4), reaproveitando o Ken Burns já existente
+    (`_aplicar_ken_burns`) DENTRO de cada trecho — cada um ganha seu
+    próprio zoom/pan contínuo, então a troca de vídeo já é, por si só, uma
+    "cena nova" visualmente, sem precisar de nenhuma transição adicional.
+
+    Faz rodízio pelos caminhos em `caminhos_disponiveis` (um por trecho,
+    ciclando se houver menos vídeos que trechos) e evita repetir o MESMO
+    vídeo do trecho imediatamente anterior sempre que houver mais de uma
+    opção disponível. Se um vídeo falhar ao abrir para um trecho
+    específico, descarta e tenta o próximo candidato (até
+    `BROLL_MAX_TENTATIVAS_POR_SEGMENTO` alternativas) antes de reaproveitar
+    o ÚLTIMO trecho que funcionou — nunca derruba o vídeo inteiro por
+    causa de um único arquivo ruim que passou pela validação leve mas
+    falhou de verdade aqui (Fase 5/8).
+
+    Retorna o clip de fundo final (mesma duração da soma dos trechos) e a
+    lista de caminhos REALMENTE usados — usada por
+    `escolher_fundo_e_criar_video()` para só confirmar no histórico
+    (`MediaManager.confirmar_uso()`) os vídeos que de fato entraram no
+    Short publicado."""
+    if not caminhos_disponiveis:
+        raise FundoInvalidoError("❌ Nenhum vídeo de fundo disponível para montar os B-rolls.")
+
+    clips_segmento: List[VideoClip] = []
+    caminhos_usados: List[str] = []
+    ultimo_caminho_ok: Optional[str] = None
+    indice_pool = 0
+
+    for indice_segmento, (inicio, fim) in enumerate(segmentos):
+        duracao_segmento = fim - inicio
+        if duracao_segmento <= 0:
+            continue
+
+        # Pontos de corte LOCAIS (relativos ao início do trecho) para o
+        # Ken Burns variar o zoom também dentro de um mesmo B-roll, quando
+        # o trecho abrange mais de um grupo de legenda.
+        pontos_locais = [
+            grupo[0].start - inicio for grupo in grupos if inicio < grupo[0].start < fim
+        ]
+
+        candidato_ok: Optional[str] = None
+        ultima_falha: Optional[Exception] = None
+        tentativas_restantes = max(1, BROLL_MAX_TENTATIVAS_POR_SEGMENTO)
+
+        while tentativas_restantes > 0 and candidato_ok is None:
+            caminho = caminhos_disponiveis[indice_pool % len(caminhos_disponiveis)]
+            indice_pool += 1
+            if caminho == ultimo_caminho_ok and len(caminhos_disponiveis) > 1:
+                caminho = caminhos_disponiveis[indice_pool % len(caminhos_disponiveis)]
+                indice_pool += 1
+
+            try:
+                clip_bruto = _preparar_clip_de_fundo(caminho, duracao_segmento, clips_para_fechar)
+            except FundoInvalidoError as err:
+                ultima_falha = err
+                tentativas_restantes -= 1
+                if media_manager is not None:
+                    media_manager.descartar(caminho)
+                print(
+                    f"⚠️ B-roll do trecho {indice_segmento + 1}/{len(segmentos)} "
+                    f"('{caminho}') falhou ({err}); tentando outro vídeo."
+                )
+                continue
+
+            candidato_ok = caminho
+            clip_segmento = _aplicar_ken_burns(clip_bruto, duracao_segmento, pontos_locais)
+            clips_para_fechar.append(clip_segmento)
+            clips_segmento.append(clip_segmento)
+            caminhos_usados.append(caminho)
+            ultimo_caminho_ok = caminho
+
+        if candidato_ok is None:
+            if ultimo_caminho_ok is None:
+                raise FundoInvalidoError(
+                    f"❌ Nenhum vídeo de fundo válido para o trecho "
+                    f"{indice_segmento + 1}/{len(segmentos)}. Último erro: {ultima_falha}"
+                )
+            print(
+                f"⚠️ Reaproveitando o último B-roll válido ('{ultimo_caminho_ok}') "
+                f"para o trecho {indice_segmento + 1}/{len(segmentos)}."
+            )
+            clip_bruto = _preparar_clip_de_fundo(ultimo_caminho_ok, duracao_segmento, clips_para_fechar)
+            clip_segmento = _aplicar_ken_burns(clip_bruto, duracao_segmento, pontos_locais)
+            clips_para_fechar.append(clip_segmento)
+            clips_segmento.append(clip_segmento)
+            caminhos_usados.append(ultimo_caminho_ok)
+
+    if not clips_segmento:
+        raise FundoInvalidoError("❌ Nenhum trecho de B-roll pôde ser montado.")
+
+    if len(clips_segmento) == 1:
+        fundo_dinamico = clips_segmento[0]
+    else:
+        fundo_dinamico = concatenate_videoclips(clips_segmento)
+        clips_para_fechar.append(fundo_dinamico)
+
+    print(f"🎞️ Fundo montado com {len(clips_segmento)} trecho(s) de B-roll.")
+    return fundo_dinamico, caminhos_usados
+
+
 def criar_video(
     roteiro_completo: str,
     caminho_audio: str,
-    caminho_video_fundo: str,
+    caminhos_video_fundo: List[str],
     caminho_saida: str = VIDEO_SAIDA_PATH,
-) -> str:
-    """Monta o vídeo final: fundo dinâmico (Ken Burns), legendas, barra de
-    progresso, vinheta e fades, cortado em 9:16."""
+    media_manager: Optional["MediaManager"] = None,
+) -> Tuple[str, List[str]]:
+    """Monta o vídeo final: fundo dinâmico com MÚLTIPLOS B-rolls (Fase 4 —
+    um vídeo diferente por trecho da narração, cada um com seu próprio Ken
+    Burns), legendas, barra de progresso, vinheta e fades, cortado em
+    9:16.
+
+    `caminhos_video_fundo` é a lista de candidatos de fundo já
+    escolhidos/validados por `escolher_fundo_e_criar_video()` — a
+    quantidade de B-rolls REALMENTE usados depende da duração da narração
+    (ver `_definir_segmentos_broll()`) e pode ser menor que
+    `len(caminhos_video_fundo)` (sobra não é desperdiçada, só não é
+    necessária) ou reaproveitar algum candidato mais de uma vez (se a
+    narração tiver mais trechos que vídeos disponíveis).
+
+    Retorna `(caminho_do_arquivo_final, caminhos_de_fundo_realmente_usados)`
+    — o segundo item é repassado a `MediaManager.confirmar_uso()` para só
+    marcar no histórico os vídeos que de fato entraram no Short publicado.
+    """
     print("🎬 [3/4] Montando vídeo final com legendas dinâmicas e design pro...")
+
+    if not caminhos_video_fundo:
+        raise FundoInvalidoError("❌ Nenhum vídeo de fundo disponível para montar o Short.")
 
     # Referências guardadas à parte para garantir o fechamento de todos os
     # clips abertos, mesmo em caso de erro no meio do processo.
     clips_para_fechar: List = []
 
     try:
-        if not os.path.exists(caminho_video_fundo):
-            raise FundoInvalidoError(
-                f"❌ Vídeo de fundo '{caminho_video_fundo}' não encontrado."
-            )
-        try:
-            clip_video = VideoFileClip(caminho_video_fundo)
-        except Exception as err:
-            raise FundoInvalidoError(
-                f"❌ Vídeo de fundo '{caminho_video_fundo}' corrompido ou ilegível: {err}"
-            ) from err
-        clips_para_fechar.append(clip_video)
-        _debug_registrar("01_abertura", clip_video)
-        _verificar_fundo_saudavel(clip_video, caminho_video_fundo)
-
         clip_audio = AudioFileClip(caminho_audio)
         clips_para_fechar.append(clip_audio)
 
@@ -2386,21 +2952,12 @@ def criar_video(
         audio_final = montar_audio_final(clip_audio, clip_musica)
         clips_para_fechar.append(audio_final)
 
-        # Loop do vídeo de fundo caso o áudio seja mais longo que o vídeo.
-        if clip_video.duration < duracao_final:
-            num_loops = math.ceil(duracao_final / clip_video.duration)
-            clip_video_loop = concatenate_videoclips([clip_video] * num_loops)
-            clips_para_fechar.append(clip_video_loop)
-            clip_video = clip_video_loop
-            _debug_registrar("04_loop", clip_video)
-        else:
-            _debug_registrar("04_loop_nao_necessario", clip_video)
-
-        clip_video = clip_video.subclip(0, duracao_final)
-        clip_video = _redimensionar_para_vertical(clip_video)
-
         # Transcreve a narração (sempre a voz limpa, antes da mixagem com
-        # música) e agrupa as palavras em blocos de legenda sincronizados.
+        # música) e agrupa as palavras em blocos de legenda sincronizados
+        # ANTES de montar o fundo: os mesmos limites de grupo
+        # (`pontos_de_corte`) definem tanto onde a legenda troca quanto
+        # onde o B-roll troca (Fase 4) — nunca uma troca de vídeo no meio
+        # de uma legenda em exibição.
         _resetar_cache_legendas()
         palavras = transcrever_narracao(caminho_audio)
         palavras, _quantidade_ajustada = _limitar_palavras_a_duracao(palavras, duracao_final)
@@ -2412,11 +2969,18 @@ def criar_video(
         grupos = agrupar_palavras_em_blocos(palavras)
         pontos_de_corte = [grupo[0].start for grupo in grupos]
 
-        # Fundo dinâmico: zoom lento contínuo + variação de zoom a cada
-        # grupo de legenda + leve pan, sempre dentro dos limites da imagem
-        # (sem bordas pretas).
-        fundo_dinamico = _aplicar_ken_burns(clip_video, duracao_final, pontos_de_corte)
-        clips_para_fechar.append(fundo_dinamico)
+        segmentos = _definir_segmentos_broll(pontos_de_corte, duracao_final)
+        print(
+            f"🎞️ {len(segmentos)} trecho(s) de B-roll planejado(s) para "
+            f"{duracao_final:.1f}s (de até {len(caminhos_video_fundo)} vídeo(s) candidato(s))."
+        )
+
+        # Fundo dinâmico: um B-roll por trecho (Fase 4), cada um com zoom
+        # lento contínuo + variação de zoom a cada grupo de legenda + leve
+        # pan, sempre dentro dos limites da imagem (sem bordas pretas).
+        fundo_dinamico, caminhos_usados = _montar_fundo_multiplo(
+            segmentos, caminhos_video_fundo, grupos, clips_para_fechar, media_manager
+        )
         _debug_registrar("05_ken_burns", fundo_dinamico)
 
         fundo_com_vinheta = _aplicar_vinheta(fundo_dinamico)
@@ -2522,7 +3086,7 @@ def criar_video(
         )
         print(f"🎬 Render concluído em {time.perf_counter() - inicio_render:.2f}s")
 
-        return caminho_saida
+        return caminho_saida, caminhos_usados
 
     finally:
         # Libera todos os recursos abertos, evitando processos/arquivos presos.
@@ -2536,38 +3100,52 @@ def criar_video(
 def escolher_fundo_e_criar_video(roteiro: str, caminho_audio: str, media_manager: MediaManager) -> str:
     """Ponte entre a biblioteca de mídia e `criar_video()`.
 
-    Antes, o caminho do fundo era sempre a constante `VIDEO_FUNDO_PATH`.
-    Agora é `media_manager.escolher_video(contexto=roteiro)` — o roteiro é
-    passado como contexto para que um provider remoto (Pexels) possa gerar
-    palavras-chave de busca a partir dele; providers locais o ignoram. O
-    resto do pipeline não muda nada.
+    Desde a Fase 4, pede um POOL de candidatos (não mais um único vídeo):
+    `media_manager.escolher_videos(contexto=roteiro, quantidade=BROLL_MAX_SEGMENTOS)`
+    — o roteiro é passado como contexto para que um provider remoto
+    (Pexels) possa gerar queries visuais de busca a partir dele; providers
+    locais o ignoram. A quantidade exata de trechos de B-roll só é
+    conhecida depois da transcrição (dentro de `criar_video()`), então
+    pede-se aqui um teto generoso; sobra não é desperdício, só não é
+    necessária.
 
     O histórico só é atualizado (`media_manager.confirmar_uso()`) DEPOIS
-    que `criar_video()` retorna com sucesso — nunca no momento da escolha.
-    Se o vídeo escolhido falhar durante a renderização de verdade
-    (`FundoInvalidoError`), descarta esse arquivo do pool desta execução
-    (sem jamais ter entrado no histórico) e tenta outro, até
-    `MEDIA_MAX_TENTATIVAS` — nunca derruba o workflow por causa de um único
-    arquivo ruim que passou pela validação leve mas falhou na hora de
-    renderizar.
+    que `criar_video()` retorna com sucesso, e SÓ para os vídeos que
+    `criar_video()` reporta como REALMENTE usados (`caminhos_usados`) —
+    nunca no momento da escolha, e nunca para candidatos que sobraram sem
+    uso. Se NENHUM dos candidatos funcionar durante a renderização de
+    verdade (`FundoInvalidoError` — o que já é raro, já que
+    `_montar_fundo_multiplo()` tenta várias alternativas e reaproveita o
+    último B-roll que funcionou por trecho), descarta todos os candidatos
+    desta tentativa e pede um novo pool, até `MEDIA_MAX_TENTATIVAS` —
+    nunca derruba o workflow por causa de vídeos ruins.
     """
     ultimo_erro: Optional[Exception] = None
 
     for tentativa in range(1, MEDIA_MAX_TENTATIVAS + 1):
-        caminho_fundo = media_manager.escolher_video(contexto=roteiro)
+        caminhos_fundo = media_manager.escolher_videos(
+            contexto=roteiro, quantidade=BROLL_MAX_SEGMENTOS
+        )
         try:
-            caminho_saida = criar_video(roteiro, caminho_audio, caminho_fundo)
+            caminho_saida, caminhos_usados = criar_video(
+                roteiro, caminho_audio, caminhos_fundo, media_manager=media_manager
+            )
         except FundoInvalidoError as err:
             ultimo_erro = err
-            media_manager.descartar(caminho_fundo)
+            for caminho in caminhos_fundo:
+                media_manager.descartar(caminho)
             print(
-                f"⚠️ Fundo '{caminho_fundo}' falhou durante a renderização ({err}); "
-                f"descartado desta execução. Tentativa {tentativa}/{MEDIA_MAX_TENTATIVAS}."
+                f"⚠️ Nenhum dos {len(caminhos_fundo)} fundo(s) candidato(s) funcionou "
+                f"durante a renderização ({err}); descartados desta execução. "
+                f"Tentativa {tentativa}/{MEDIA_MAX_TENTATIVAS}."
             )
         else:
-            # Só agora, com o vídeo final de verdade pronto, a mídia é
-            # considerada "usada" e entra no histórico persistente.
-            media_manager.confirmar_uso(caminho_fundo)
+            # Só agora, com o vídeo final de verdade pronto, cada mídia
+            # REALMENTE usada (pode ser menos que `caminhos_fundo`, ou
+            # repetir alguma) é considerada "usada" e entra no histórico
+            # persistente.
+            for caminho in caminhos_usados:
+                media_manager.confirmar_uso(caminho)
             return caminho_saida
 
     raise RuntimeError(
