@@ -31,6 +31,7 @@ Rodar com:  python -m unittest tests.test_pexels_broll -v
 import io
 import json
 import os
+import random
 import sys
 import types
 import unittest
@@ -439,13 +440,51 @@ class TestPrepararClipDeFundo(unittest.TestCase):
             resultado = bot_main._preparar_clip_de_fundo("longo.mp4", duracao_alvo=6.0, clips_para_fechar=[])
 
         mock_concat.assert_not_called()  # não precisa de loop
-        self.assertEqual(clip_longo.subclip_chamado_com, (0, 6.0))
+        # Fase 2 (item 12): com folga grande (30s de origem para 6s de
+        # alvo), o ponto inicial agora VARIA em vez de ser sempre 0 — só a
+        # DURAÇÃO do corte (sempre 6.0s) e os limites (nunca negativo, nunca
+        # ultrapassa o fim do clipe) são garantidos.
+        inicio_usado, fim_usado = clip_longo.subclip_chamado_com
+        self.assertAlmostEqual(fim_usado - inicio_usado, 6.0)
+        self.assertGreaterEqual(inicio_usado, 0.0)
+        self.assertLessEqual(fim_usado, 30.0)
         self.assertAlmostEqual(resultado.duration, 6.0)
 
     def test_arquivo_inexistente_levanta_fundo_invalido(self):
         with mock.patch("bot_main.os.path.exists", return_value=False):
             with self.assertRaises(bot_main.FundoInvalidoError):
                 bot_main._preparar_clip_de_fundo("nao_existe.mp4", duracao_alvo=5.0, clips_para_fechar=[])
+
+
+# ===========================================================================
+# 8b. _escolher_ponto_de_corte_temporal() — variação do ponto inicial do
+#     corte quando há folga (Fase 2, item 12)
+# ===========================================================================
+class TestEscolherPontoDeCorteTemporal(unittest.TestCase):
+    def test_folga_pequena_mantem_inicio_em_zero(self):
+        # 6.5s de origem para 6.0s de alvo = 0.5s de folga, abaixo do
+        # mínimo (BROLL_FOLGA_MINIMA_PARA_VARIAR_INICIO=1.0s) — mantém o
+        # comportamento antigo (sempre começa em 0).
+        ponto = bot_main._escolher_ponto_de_corte_temporal(duracao_origem=6.5, duracao_alvo=6.0)
+        self.assertEqual(ponto, 0.0)
+
+    def test_folga_grande_varia_dentro_dos_limites_seguros(self):
+        random.seed(42)
+        for _ in range(50):
+            ponto = bot_main._escolher_ponto_de_corte_temporal(duracao_origem=60.0, duracao_alvo=6.0)
+            self.assertGreaterEqual(ponto, 0.0)
+            self.assertLessEqual(ponto + 6.0, 60.0)
+
+    def test_folga_grande_produz_pontos_iniciais_diferentes_entre_chamadas(self):
+        random.seed(7)
+        pontos = {bot_main._escolher_ponto_de_corte_temporal(60.0, 6.0) for _ in range(20)}
+        self.assertGreater(len(pontos), 1)  # não é sempre o mesmo valor fixo
+
+    def test_nunca_ultrapassa_duracao_de_origem(self):
+        random.seed(1)
+        for _ in range(50):
+            ponto = bot_main._escolher_ponto_de_corte_temporal(duracao_origem=8.0, duracao_alvo=6.0)
+            self.assertLessEqual(ponto + 6.0, 8.0 + 1e-9)
 
 
 # ===========================================================================
@@ -861,6 +900,314 @@ class TestFallbackTTS(unittest.TestCase):
 
         self.assertEqual(chamadas["openai"], bot_main.TTS_TENTATIVAS_POR_PROVEDOR)
         self.assertEqual(chamadas["google"], 1)
+
+
+# ===========================================================================
+# 17. _texto_do_segmento() — reconstrói o texto narrado em cada trecho a
+#     partir das PalavraLegenda (Fase 2, item 2/3)
+# ===========================================================================
+def _palavra(texto: str, start: float, end: float, index: int) -> "bot_main.PalavraLegenda":
+    return bot_main.PalavraLegenda(palavra=texto, start=start, end=end, duration=end - start, index=index)
+
+
+class TestTextoDoSegmento(unittest.TestCase):
+    def test_junta_apenas_palavras_do_intervalo(self):
+        palavras = [
+            _palavra("Saturno", 0.0, 0.5, 0),
+            _palavra("tem", 0.5, 0.8, 1),
+            _palavra("aneis", 0.8, 1.3, 2),
+            _palavra("enormes", 6.0, 6.5, 3),  # já no PRÓXIMO trecho
+        ]
+        texto = bot_main._texto_do_segmento((0.0, 6.0), palavras)
+        self.assertEqual(texto, "Saturno tem aneis")
+
+    def test_intervalo_sem_palavras_retorna_string_vazia(self):
+        palavras = [_palavra("Saturno", 10.0, 10.5, 0)]
+        texto = bot_main._texto_do_segmento((0.0, 6.0), palavras)
+        self.assertEqual(texto, "")
+
+    def test_usa_o_inicio_da_palavra_como_criterio_de_pertencimento(self):
+        # Uma palavra que COMEÇA dentro do trecho pertence a ele mesmo que
+        # termine depois do limite (`fim` do trecho) — mesmo critério de
+        # `_definir_segmentos_broll()`.
+        palavras = [_palavra("particulas", 5.8, 6.4, 0)]
+        texto = bot_main._texto_do_segmento((0.0, 6.0), palavras)
+        self.assertEqual(texto, "particulas")
+
+
+# ===========================================================================
+# 18. _pontuar_candidato_broll() — score de relevância/qualidade/
+#     orientação/duração/diversidade (Fase 2, item 9)
+# ===========================================================================
+class TestPontuarCandidatoBroll(unittest.TestCase):
+    def _video(self, **overrides):
+        base = {"id": 1, "width": 1920, "height": 1080, "duration": 12}
+        base.update(overrides)
+        return base
+
+    def _arquivo(self, **overrides):
+        base = {"width": 1920, "height": 1080}
+        base.update(overrides)
+        return base
+
+    def test_resolucao_maior_pontua_mais(self):
+        video = self._video()
+        candidato_a = self._arquivo(width=1280)
+        candidato_b = self._arquivo(width=1920)
+        score_a = bot_main._pontuar_candidato_broll(video, candidato_a, 0, 4, duracao_alvo=6.0)
+        score_b = bot_main._pontuar_candidato_broll(video, candidato_b, 0, 4, duracao_alvo=6.0)
+        self.assertGreater(score_b, score_a)
+
+    def test_vertical_pontua_mais_que_horizontal(self):
+        arquivo = self._arquivo()
+        video_vertical = self._video(width=1080, height=1920)
+        video_horizontal = self._video(width=1920, height=1080)
+        score_vertical = bot_main._pontuar_candidato_broll(video_vertical, arquivo, 0, 4, duracao_alvo=6.0)
+        score_horizontal = bot_main._pontuar_candidato_broll(video_horizontal, arquivo, 0, 4, duracao_alvo=6.0)
+        self.assertGreater(score_vertical, score_horizontal)
+
+    def test_query_mais_relevante_pontua_mais_que_a_ultima_da_cascata(self):
+        video = self._video()
+        arquivo = self._arquivo()
+        score_primeira_query = bot_main._pontuar_candidato_broll(video, arquivo, 0, 4, duracao_alvo=6.0)
+        score_ultima_query = bot_main._pontuar_candidato_broll(video, arquivo, 3, 4, duracao_alvo=6.0)
+        self.assertGreater(score_primeira_query, score_ultima_query)
+
+    def test_video_ja_usado_pontua_menos_mas_nao_zera(self):
+        video = self._video(id=42)
+        arquivo = self._arquivo()
+        score_inedito = bot_main._pontuar_candidato_broll(video, arquivo, 0, 4, duracao_alvo=6.0, ja_usados=set())
+        score_repetido = bot_main._pontuar_candidato_broll(
+            video, arquivo, 0, 4, duracao_alvo=6.0, ja_usados={"42"}
+        )
+        self.assertGreater(score_inedito, score_repetido)
+        # penalidade é leve (peso 5%), nunca elimina o candidato
+        self.assertGreater(score_repetido, 0.0)
+
+    def test_duracao_com_folga_confortavel_pontua_mais_que_no_limite(self):
+        arquivo = self._arquivo()
+        video_no_limite = self._video(duration=6.0)  # exatamente a duração do trecho
+        video_com_folga = self._video(duration=14.0)  # ~2.3x a duração do trecho
+        score_no_limite = bot_main._pontuar_candidato_broll(video_no_limite, arquivo, 0, 4, duracao_alvo=6.0)
+        score_com_folga = bot_main._pontuar_candidato_broll(video_com_folga, arquivo, 0, 4, duracao_alvo=6.0)
+        self.assertGreater(score_com_folga, score_no_limite)
+
+
+# ===========================================================================
+# 19. PexelsMediaProvider._buscar_com_fallback_de_queries() — cascata,
+#     cache de execução e teto de downloads (Fase 2, itens 6/7/19)
+# ===========================================================================
+class TestBuscarComFallbackDeQueries(unittest.TestCase):
+    def setUp(self):
+        self.provider = bot_main.PexelsMediaProvider.__new__(bot_main.PexelsMediaProvider)
+        self.provider.api_key = "chave-de-teste"
+        self.provider.cache_dir = "/tmp/cache_teste_fase2"
+        self.provider.metadata_path = "/tmp/cache_teste_fase2/metadata.json"
+        self.provider._metadata = {}
+        self.provider._rejeitados_nesta_execucao = set()
+        self.provider._cache_busca_execucao = {}
+        self.provider._downloads_nesta_execucao = 0
+
+    def _video(self, video_id, duration=12, width=1920, height=1080):
+        return {
+            "id": video_id,
+            "duration": duration,
+            "width": width,
+            "height": height,
+            "video_files": [{"width": width, "height": height, "fps": 30, "link": f"https://cdn/{video_id}.mp4"}],
+        }
+
+    def test_cascata_pula_para_proxima_query_quando_a_primeira_nao_acha_nada(self):
+        chamadas = []
+
+        def fake_buscar(query):
+            chamadas.append(query)
+            if query == "saturn rings":
+                return []  # 1ª query sem resultados
+            return [self._video(1)]  # 2ª query funciona
+
+        with mock.patch.object(self.provider, "_buscar", side_effect=fake_buscar), mock.patch.object(
+            self.provider, "_baixar_arquivo", return_value=True
+        ), mock.patch.object(self.provider, "_salvar_metadata"):
+            itens = self.provider._buscar_com_fallback_de_queries(
+                ["saturn rings", "saturn planet"], duracao_alvo=6.0, ids_evitar=set()
+            )
+
+        self.assertEqual(chamadas, ["saturn rings", "saturn planet"])
+        self.assertEqual(len(itens), 1)
+
+    def test_mesma_query_repetida_entre_chamadas_nao_dispara_2a_requisicao(self):
+        contagem = {"n": 0}
+
+        def fake_buscar(query):
+            contagem["n"] += 1
+            return [self._video(1)]
+
+        with mock.patch.object(self.provider, "_buscar", side_effect=fake_buscar), mock.patch.object(
+            self.provider, "_baixar_arquivo", return_value=True
+        ), mock.patch.object(self.provider, "_salvar_metadata"):
+            self.provider._buscar_com_fallback_de_queries(["saturn rings"], duracao_alvo=6.0, ids_evitar=set())
+            # 2ª "cena" gera a MESMA query — não deve chamar a API de novo.
+            self.provider._buscar_com_fallback_de_queries(["saturn rings"], duracao_alvo=6.0, ids_evitar=set())
+
+        self.assertEqual(contagem["n"], 1)
+
+    def test_para_de_buscar_queries_apos_achar_candidatos_suficientes(self):
+        chamadas = []
+
+        def fake_buscar(query):
+            chamadas.append(query)
+            # cada query já devolve BROLL_CANDIDATOS_POR_TRECHO_ALVO vídeos distintos
+            return [self._video(v) for v in range(100, 100 + bot_main.BROLL_CANDIDATOS_POR_TRECHO_ALVO)]
+
+        with mock.patch.object(self.provider, "_buscar", side_effect=fake_buscar), mock.patch.object(
+            self.provider, "_baixar_arquivo", return_value=True
+        ), mock.patch.object(self.provider, "_salvar_metadata"):
+            self.provider._buscar_com_fallback_de_queries(
+                ["q1", "q2", "q3", "q4"], duracao_alvo=6.0, ids_evitar=set()
+            )
+
+        # a 1ª query já rendeu candidatos suficientes — não deveria ter
+        # gastado busca nenhuma das outras 3.
+        self.assertEqual(chamadas, ["q1"])
+
+    def test_respeita_teto_de_downloads_da_execucao(self):
+        bot_main.PEXELS_MAX_DOWNLOADS
+        self.provider._downloads_nesta_execucao = bot_main.PEXELS_MAX_DOWNLOADS  # já no teto
+
+        with mock.patch.object(self.provider, "_buscar", return_value=[self._video(1)]), mock.patch.object(
+            self.provider, "_baixar_arquivo", return_value=True
+        ) as mock_baixar:
+            itens = self.provider._buscar_com_fallback_de_queries(["q1"], duracao_alvo=6.0, ids_evitar=set())
+
+        mock_baixar.assert_not_called()
+        self.assertEqual(itens, [])
+
+    def test_resultados_voltam_ordenados_por_score_decrescente(self):
+        def fake_buscar(query):
+            return [
+                self._video(1, width=1280),  # qualidade pior
+                self._video(2, width=1920),  # qualidade melhor -> deve vir primeiro
+            ]
+
+        with mock.patch.object(self.provider, "_buscar", side_effect=fake_buscar), mock.patch.object(
+            self.provider, "_baixar_arquivo", return_value=True
+        ), mock.patch.object(self.provider, "_salvar_metadata"):
+            itens = self.provider._buscar_com_fallback_de_queries(["q1"], duracao_alvo=6.0, ids_evitar=set())
+
+        self.assertEqual(len(itens), 2)
+        self.assertIn("2.mp4", itens[0].caminho)
+
+
+# ===========================================================================
+# 20. MediaManager.escolher_video_contextual() — nunca lança exceção,
+#     cai para o fallback, respeita diversidade (Fase 2, itens 10/21)
+# ===========================================================================
+class FakeMediaProviderContextual(bot_main.MediaProvider):
+    """Fake que sabe responder de forma diferente conforme o texto — usado
+    para testar que `escolher_video_contextual` realmente repassa o texto
+    do trecho ao provider, e não apenas ignora (como o `FakeMediaProvider`
+    genérico, que herda o comportamento default)."""
+
+    def __init__(self, resposta_por_texto=None, itens_padrao=None, falha=None):
+        self.resposta_por_texto = resposta_por_texto or {}
+        self.itens_padrao = itens_padrao or []
+        self.falha = falha
+        self.chamadas: List[Tuple[str, float, set]] = []
+
+    def listar_videos(self, contexto=None):
+        return list(self.itens_padrao)
+
+    def listar_videos_contextual(self, texto, duracao_alvo, ids_evitar=None):
+        self.chamadas.append((texto, duracao_alvo, ids_evitar))
+        if self.falha:
+            raise self.falha
+        return list(self.resposta_por_texto.get(texto, self.itens_padrao))
+
+    def validar_video(self, item):
+        return True
+
+
+class TestEscolherVideoContextual(unittest.TestCase):
+    def test_repassa_texto_e_duracao_ao_provider(self):
+        item = _media_item("saturno.mp4")
+        provider = FakeMediaProviderContextual(resposta_por_texto={"saturno tem aneis": [item]})
+        manager = bot_main.MediaManager(
+            provider=provider, provider_fallback=None, arquivo_historico="/tmp/hist_ctx_1.json"
+        )
+
+        with mock.patch("builtins.print"):
+            resultado = manager.escolher_video_contextual("saturno tem aneis", duracao_alvo=6.0)
+
+        self.assertEqual(resultado, "saturno.mp4")
+        self.assertEqual(provider.chamadas[0][0], "saturno tem aneis")
+        self.assertEqual(provider.chamadas[0][1], 6.0)
+
+    def test_primario_sem_candidato_cai_para_fallback(self):
+        primario = FakeMediaProviderContextual(itens_padrao=[])
+        item_local = _media_item("assets/videos/local.mp4")
+        fallback = FakeMediaProviderContextual(itens_padrao=[item_local])
+        manager = bot_main.MediaManager(
+            provider=primario, provider_fallback=fallback, arquivo_historico="/tmp/hist_ctx_2.json"
+        )
+
+        with mock.patch("builtins.print"):
+            resultado = manager.escolher_video_contextual("qualquer texto", duracao_alvo=6.0)
+
+        self.assertEqual(resultado, "assets/videos/local.mp4")
+
+    def test_primario_levanta_excecao_cai_para_fallback_sem_propagar(self):
+        primario = FakeMediaProviderContextual(falha=RuntimeError("Pexels fora do ar"))
+        item_local = _media_item("assets/videos/local.mp4")
+        fallback = FakeMediaProviderContextual(itens_padrao=[item_local])
+        manager = bot_main.MediaManager(
+            provider=primario, provider_fallback=fallback, arquivo_historico="/tmp/hist_ctx_3.json"
+        )
+
+        with mock.patch("builtins.print"):
+            resultado = manager.escolher_video_contextual("qualquer texto", duracao_alvo=6.0)
+
+        self.assertEqual(resultado, "assets/videos/local.mp4")
+
+    def test_nenhum_provider_com_candidato_retorna_none_sem_lancar(self):
+        primario = FakeMediaProviderContextual(itens_padrao=[])
+        fallback = FakeMediaProviderContextual(itens_padrao=[])
+        manager = bot_main.MediaManager(
+            provider=primario, provider_fallback=fallback, arquivo_historico="/tmp/hist_ctx_4.json"
+        )
+
+        with mock.patch("builtins.print"):
+            resultado = manager.escolher_video_contextual("qualquer texto", duracao_alvo=6.0)
+
+        self.assertIsNone(resultado)  # nunca levanta — Fase 2, item 21: resiliência é absoluta
+
+    def test_prefere_candidato_fora_do_excluir_quando_disponivel(self):
+        item_ja_usado = _media_item("ja_usado.mp4")
+        item_novo = _media_item("novo.mp4")
+        # A ordem de retorno já reflete o score (o provider real ordena);
+        # aqui simulamos o provider devolvendo o já-usado primeiro para
+        # confirmar que o desempate por `excluir` reordena antes da validação.
+        provider = FakeMediaProviderContextual(itens_padrao=[item_ja_usado, item_novo])
+        manager = bot_main.MediaManager(
+            provider=provider, provider_fallback=None, arquivo_historico="/tmp/hist_ctx_5.json"
+        )
+
+        with mock.patch("builtins.print"):
+            resultado = manager.escolher_video_contextual(
+                "texto", duracao_alvo=6.0, excluir={"ja_usado.mp4"}
+            )
+
+        self.assertEqual(resultado, "novo.mp4")
+
+
+# ===========================================================================
+# 21. _escolher_ponto_de_corte_temporal() já coberto na seção 8b acima.
+# 22. Rejeição de vídeo ruim (duração/resolução/preto) — cobertura já
+#     existente na Fase 1 via `_validar_arquivo_video()`
+#     (TestGeometriaVertical/TestPrepararClipDeFundo) e
+#     `_verificar_fundo_saudavel()` — sem mudança de comportamento nesta
+#     fase, então sem testes novos aqui.
+# ===========================================================================
 
 
 if __name__ == "__main__":

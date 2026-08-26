@@ -150,6 +150,24 @@ BROLL_SEGMENTO_DURACAO_ALVO: float = 6.0  # segundos; duração alvo de cada tre
 BROLL_SEGMENTO_DURACAO_MINIMA: float = 3.0  # segundos; nunca fecha um trecho final menor que isso sozinho
 BROLL_MAX_SEGMENTOS: int = 6  # teto de trechos por vídeo (também o nº de candidatos pedidos ao MediaManager)
 BROLL_MAX_TENTATIVAS_POR_SEGMENTO: int = 2  # candidatos alternativos testados por trecho antes de reaproveitar o último que funcionou
+# Folga mínima (fim do vídeo de origem menos a duração que o trecho
+# precisa) para variar o ponto inicial do corte em vez de sempre começar
+# em 0s (Fase 2, item 12: evita sempre usar os mesmos primeiros segundos
+# de um vídeo de fundo comprido — normalmente intro/logo/frame estático).
+BROLL_FOLGA_MINIMA_PARA_VARIAR_INICIO: float = 1.0  # segundos
+
+# --- B-roll contextual por trecho (Fase 2) ---
+# Cada trecho de B-roll (ver BROLL_SEGMENTO_DURACAO_ALVO acima) busca
+# candidatos com base no texto REALMENTE narrado NAQUELE trecho (não o
+# roteiro inteiro) — ver `_texto_do_segmento()` / `_selecionar_broll_por_segmento()`.
+BROLL_CANDIDATOS_POR_TRECHO_ALVO: int = 3  # candidatos pontuados o bastante para parar de buscar mais queries
+BROLL_MAX_QUERIES_POR_TRECHO: int = 4  # cascata de queries tentadas por trecho antes de desistir (item 19: limite de requests)
+# Pesos do score de cada candidato (soma 1.0) — ver `_pontuar_candidato_broll()`.
+BROLL_PESO_RELEVANCIA: float = 0.50   # posição da query na cascata (a 1ª query é a mais específica ao trecho)
+BROLL_PESO_QUALIDADE: float = 0.20    # resolução do arquivo de vídeo
+BROLL_PESO_ORIENTACAO: float = 0.15   # proximidade do aspect ratio de origem com 9:16
+BROLL_PESO_DURACAO: float = 0.10      # folga confortável entre a duração do vídeo e a do trecho
+BROLL_PESO_DIVERSIDADE: float = 0.05  # penalidade leve (não eliminatória) se o vídeo já foi usado neste Short
 
 # --- Biblioteca de mídia (MediaManager) ---
 MEDIA_VIDEOS_DIR: str = "assets/videos"  # pode ter subpastas por tema (minecraft/, parkour/, ...)
@@ -467,6 +485,27 @@ class MediaProvider(ABC):
         precisa (ex.: PexelsMediaProvider invalida o cache do item)."""
         return None
 
+    def listar_videos_contextual(
+        self, texto: str, duracao_alvo: float, ids_evitar: Optional[set] = None
+    ) -> List[MediaItem]:
+        """Hook opcional (Fase 2 — B-roll contextual por trecho): providers
+        capazes de gerar candidatos relevantes para um TRECHO específico da
+        narração (não o roteiro inteiro) sobrescrevem isto, tipicamente
+        gerando uma cascata de queries a partir de `texto` e pontuando os
+        resultados (relevância/qualidade/orientação/duração/diversidade).
+
+        `ids_evitar` é o conjunto de identificadores (aqui, caminhos de
+        arquivo) já usados em OUTROS trechos deste mesmo Short — usado
+        para preferir diversidade visual entre cenas, nunca para excluir
+        de forma absoluta (ver `_pontuar_candidato_broll`).
+
+        Default: delega para `listar_videos(texto)` — o mesmo
+        comportamento de antes da Fase 2, sem quebrar nenhum provider que
+        não sabe (ou não precisa saber) trabalhar por trecho — caso do
+        `LocalMediaProvider`, que ignora `contexto`/`texto` de qualquer
+        forma."""
+        return self.listar_videos(texto)
+
 
 def _validar_arquivo_video(caminho: str) -> bool:
     """Validação completa de um arquivo de vídeo, compartilhada por todos
@@ -607,6 +646,88 @@ class LocalMediaProvider(MediaProvider):
             return False
 
 
+def _pontuar_candidato_broll(
+    video: dict,
+    arquivo: dict,
+    indice_query: int,
+    total_queries: int,
+    duracao_alvo: float,
+    ja_usados: Optional[set] = None,
+) -> float:
+    """Pontua (0-100) um candidato de B-roll do Pexels para um trecho
+    específico (Fase 2). Combina 5 fatores com pesos fixos (soma 1.0,
+    ver `BROLL_PESO_*`):
+
+    - Relevância (50%): posição da query que encontrou o vídeo na cascata
+      gerada por `_gerar_queries_visuais()` — a 1ª query é sempre a mais
+      específica ao trecho (dicionário visual PT->EN), então um resultado
+      da 1ª query pontua mais que um da 4ª.
+    - Qualidade (20%): resolução do arquivo de vídeo escolhido
+      (`_escolher_arquivo()`), normalizada contra `PEXELS_RESOLUCAO_PREFERIDA`.
+    - Orientação (15%): proximidade do aspect ratio de ORIGEM do vídeo
+      com 9:16 — vídeos já verticais pontuam mais, mas um horizontal bom
+      ainda pontua razoavelmente (nunca é descartado só por isso; o
+      pipeline já sabe cortar/zoom para vertical).
+    - Duração (10%): favorece vídeos com folga confortável sobre a
+      duração do trecho (nem curtos demais — já filtrados antes por
+      `MEDIA_VIDEO_DURACAO_MINIMA` — nem desproporcionalmente longos).
+    - Diversidade (5%): penalidade leve (não eliminatória) se este vídeo
+      já foi usado em outro trecho do MESMO Short — dá preferência a
+      variedade sem nunca escolher um candidato irrelevante só para
+      evitar repetição (item 10 da Fase 2: "é melhor reutilizar um vídeo
+      bom do que usar um vídeo completamente irrelevante").
+
+    Pura e sem I/O — testável isoladamente com dicts feitos à mão.
+    """
+    ja_usados = ja_usados or set()
+
+    # --- relevância: 1.0 na 1ª query, decaindo linearmente até perto de 0 ---
+    relevancia = 1.0 - (indice_query / max(1, total_queries))
+
+    # --- qualidade: resolução do arquivo vs a preferida ---
+    largura_arquivo = arquivo.get("width") or 0
+    largura_preferida = PEXELS_RESOLUCAO_PREFERIDA[0]
+    qualidade = min(1.0, largura_arquivo / largura_preferida) if largura_preferida else 0.0
+
+    # --- orientação: aspect ratio de origem vs 9:16 (ASPECT_RATIO) ---
+    largura_video = video.get("width") or 0
+    altura_video = video.get("height") or 0
+    if largura_video and altura_video:
+        aspect_origem = largura_video / altura_video
+        # distância normalizada: 0 = exatamente 9:16, 1 = o mais distante
+        # que consideramos plausível (bem quadrado ou bem panorâmico).
+        distancia = abs(aspect_origem - ASPECT_RATIO) / ASPECT_RATIO
+        orientacao = max(0.0, 1.0 - min(distancia, 1.5) / 1.5)
+    else:
+        orientacao = 0.5  # sem informação de aspect ratio — nem penaliza nem beneficia
+
+    # --- duração: folga confortável sobre o trecho, sem exagero ---
+    duracao_video = video.get("duration") or 0
+    if duracao_alvo > 0 and duracao_video > 0:
+        folga = duracao_video / duracao_alvo
+        if folga < 1.0:
+            duracao_score = 0.0  # não deveria acontecer (já filtrado antes), mas nunca pontua acima do alvo
+        elif folga <= 3.0:
+            duracao_score = (folga - 1.0) / 2.0  # cresce suavemente até 3x a duração do trecho
+        else:
+            duracao_score = 1.0 - min((folga - 3.0) / 10.0, 0.5)  # vídeos MUITO mais longos perdem um pouco de pontos
+    else:
+        duracao_score = 0.5
+
+    # --- diversidade: penaliza (não zera) reuso dentro do mesmo Short ---
+    video_id = str(video.get("id"))
+    diversidade = 0.0 if video_id in ja_usados else 1.0
+
+    score = (
+        BROLL_PESO_RELEVANCIA * relevancia
+        + BROLL_PESO_QUALIDADE * qualidade
+        + BROLL_PESO_ORIENTACAO * orientacao
+        + BROLL_PESO_DURACAO * duracao_score
+        + BROLL_PESO_DIVERSIDADE * diversidade
+    )
+    return round(score * 100, 2)
+
+
 class PexelsMediaProvider(MediaProvider):
     """Provider remoto: busca, baixa e cacheia vídeos do banco Pexels a
     partir de palavras-chave extraídas do roteiro. Usa SOMENTE a API
@@ -652,6 +773,22 @@ class PexelsMediaProvider(MediaProvider):
         # ser reconhecido como "já visto" e poderia ser rebaixado e
         # escolhido de novo no mesmo `escolher_fundo_e_criar_video()`.
         self._rejeitados_nesta_execucao: set = set()
+        # Fase 2 (B-roll contextual): cache de resultados de busca EM
+        # MEMÓRIA, válido só durante esta execução — se duas cenas do
+        # mesmo Short gerarem a mesma query (comum: "saturn" pode
+        # aparecer na cascata de mais de um trecho), a segunda NUNCA
+        # dispara uma nova requisição HTTP, só reaproveita a lista já
+        # obtida. Chave = string da query; valor = lista de vídeos crus
+        # retornados pela API (ou lista vazia, se a busca falhou — também
+        # cacheado, para não tentar de novo a mesma query com erro
+        # repetidamente dentro da mesma execução).
+        self._cache_busca_execucao: Dict[str, List[dict]] = {}
+        # Contador de downloads efetivos nesta execução, compartilhado
+        # entre o fluxo antigo (`listar_videos`) e o novo por-trecho
+        # (`listar_videos_contextual`) — item 19 da Fase 2: nunca deixa o
+        # total de downloads da execução (não só de uma chamada isolada)
+        # ultrapassar `PEXELS_MAX_DOWNLOADS`.
+        self._downloads_nesta_execucao: int = 0
 
     # --- cache / metadata ---------------------------------------------------
     def _carregar_metadata(self) -> Dict[str, dict]:
@@ -970,11 +1107,14 @@ class PexelsMediaProvider(MediaProvider):
         for query in queries:
             if len(em_cache) + len(novos) >= PEXELS_MAX_DOWNLOADS:
                 break
-            try:
-                resultados = self._buscar(query)
-            except RuntimeError as err:
-                print(f"⚠️ {err}")
-                continue
+            resultados = self._cache_busca_execucao.get(query)
+            if resultados is None:
+                try:
+                    resultados = self._buscar(query)
+                except RuntimeError as err:
+                    print(f"⚠️ {err}")
+                    resultados = []
+                self._cache_busca_execucao[query] = resultados
 
             for video in resultados:
                 if len(em_cache) + len(novos) >= PEXELS_MAX_DOWNLOADS:
@@ -997,6 +1137,7 @@ class PexelsMediaProvider(MediaProvider):
                 destino = os.path.join(self.cache_dir, f"{video_id}.mp4")
                 if not self._baixar_arquivo(arquivo["link"], destino):
                     continue  # download quebrado/interrompido — já tratado e logado
+                self._downloads_nesta_execucao += 1
 
                 self._metadata[video_id] = {
                     "caminho": destino,
@@ -1009,6 +1150,110 @@ class PexelsMediaProvider(MediaProvider):
             self._salvar_metadata()
 
         return em_cache + novos
+
+    # --- B-roll contextual por trecho (Fase 2) ------------------------------
+    def listar_videos_contextual(
+        self, texto: str, duracao_alvo: float, ids_evitar: Optional[set] = None
+    ) -> List[MediaItem]:
+        """Sobrescreve o hook default: gera uma cascata de queries a partir
+        do texto REALMENTE narrado neste trecho (via `_gerar_queries_visuais`,
+        já reaproveitado sem alteração — funciona para qualquer string, não
+        só o roteiro inteiro) e devolve candidatos ORDENADOS por
+        `_pontuar_candidato_broll` (melhor primeiro)."""
+        if not texto:
+            return []
+        queries = self._gerar_queries_visuais(texto)[:BROLL_MAX_QUERIES_POR_TRECHO]
+        print("🔎 Queries:")
+        for indice, query in enumerate(queries, start=1):
+            print(f"   {indice}. {query}")
+        itens = self._buscar_com_fallback_de_queries(queries, duracao_alvo, ids_evitar or set())
+        if itens:
+            melhor = itens[0]
+            print(f"🎯 Melhor candidato: {melhor.caminho} ({melhor.categoria})")
+        else:
+            print("⚠️ Nenhum candidato Pexels relevante para este trecho.")
+        return itens
+
+    def _buscar_com_fallback_de_queries(
+        self, queries: List[str], duracao_alvo: float, ids_evitar: set
+    ) -> List[MediaItem]:
+        """Cascata de queries (item 6 da Fase 2): tenta a query mais
+        específica primeiro; só desce para a próxima se ainda não achou
+        `BROLL_CANDIDATOS_POR_TRECHO_ALVO` candidatos bons — nunca gasta
+        mais buscas do que precisa (item 19: limite de requests). Resultado
+        de cada query fica em `_cache_busca_execucao` (item 7: reutilizar
+        resultados — compartilhado com `listar_videos()`), então duas
+        cenas com queries iguais nunca disparam uma segunda requisição.
+
+        Cada candidato é pontuado (`_pontuar_candidato_broll`, item 9) e a
+        lista final volta ORDENADA por score decrescente — quem chama (o
+        `MediaManager`) só precisa pegar o primeiro que passar na
+        validação completa."""
+        candidatos_pontuados: List[Tuple[float, dict, dict, str, str]] = []
+        total_queries = max(1, len(queries))
+
+        for indice_query, query in enumerate(queries):
+            if len({c[3] for c in candidatos_pontuados}) >= BROLL_CANDIDATOS_POR_TRECHO_ALVO:
+                break  # já tem candidatos suficientes; não gasta mais buscas
+
+            resultados = self._cache_busca_execucao.get(query)
+            if resultados is None:
+                try:
+                    resultados = self._buscar(query)
+                except RuntimeError as err:
+                    print(f"⚠️ {err}")
+                    resultados = []
+                self._cache_busca_execucao[query] = resultados
+
+            for video in resultados:
+                duracao = video.get("duration", 0)
+                if duracao < MEDIA_VIDEO_DURACAO_MINIMA:
+                    continue
+                video_id = str(video.get("id"))
+                if video_id in self._rejeitados_nesta_execucao:
+                    continue
+                arquivo = self._escolher_arquivo(video)
+                if arquivo is None:
+                    continue
+                score = _pontuar_candidato_broll(
+                    video, arquivo, indice_query, total_queries, duracao_alvo, ids_evitar
+                )
+                candidatos_pontuados.append((score, video, arquivo, video_id, query))
+
+        candidatos_pontuados.sort(key=lambda item: item[0], reverse=True)
+
+        itens: List[MediaItem] = []
+        vistos: set = set()
+        for score, video, arquivo, video_id, query_origem in candidatos_pontuados:
+            if video_id in vistos:
+                continue  # o mesmo vídeo pode ter sido encontrado por mais de uma query da cascata
+            vistos.add(video_id)
+
+            if video_id in self._metadata and self._cache_valido(self._metadata[video_id]):
+                itens.append(
+                    MediaItem(caminho=self._metadata[video_id]["caminho"], categoria=f"pexels/score={score:.1f}", tipo="video")
+                )
+                continue
+
+            if self._downloads_nesta_execucao >= PEXELS_MAX_DOWNLOADS:
+                continue  # teto de downloads da execução (item 19) — mesmo com candidatos bons sobrando
+
+            destino = os.path.join(self.cache_dir, f"{video_id}.mp4")
+            if not self._baixar_arquivo(arquivo["link"], destino):
+                continue
+            self._downloads_nesta_execucao += 1
+
+            self._metadata[video_id] = {
+                "caminho": destino,
+                "baixado_em": time.time(),
+                "query": query_origem,
+            }
+            itens.append(MediaItem(caminho=destino, categoria=f"pexels/score={score:.1f}", tipo="video"))
+
+        if itens:
+            self._salvar_metadata()
+
+        return itens
 
     def validar_video(self, item: MediaItem) -> bool:
         return _validar_arquivo_video(item.caminho)
@@ -1248,6 +1493,74 @@ class MediaManager:
             f"Nenhum dos {tentativas} vídeo(s) testado(s) via {type(provider).__name__} "
             f"passou na validação."
         )
+
+    # --- B-roll contextual por trecho (Fase 2) ------------------------------
+    def escolher_video_contextual(
+        self, texto: str, duracao_alvo: float, excluir: Optional[set] = None
+    ) -> Optional[str]:
+        """Como `escolher_video()`, mas pede candidatos relevantes para um
+        TRECHO específico (Fase 2 — B-roll contextual), não para o
+        roteiro inteiro (`MediaProvider.listar_videos_contextual`).
+
+        Ao contrário de `escolher_video()`/`escolher_videos()`, NUNCA
+        levanta exceção: se nem o provider primário nem o de fallback
+        conseguirem nada, devolve `None` e quem chamou decide o próximo
+        passo (ver `_montar_fundo_multiplo()`, que cai para um pool de
+        reserva ou reaproveita o último B-roll que funcionou — item 21
+        da Fase 2: resiliência do pipeline é um requisito absoluto,
+        mesmo que a busca contextual falhe por completo).
+
+        `excluir` é só preferência de diversidade (item 10): candidatos
+        nesse conjunto são despriorizados, nunca descartados — melhor
+        reutilizar um vídeo bom do que usar um irrelevante."""
+        excluir = excluir or set()
+        candidato = self._tentar_contextual(self.provider, texto, duracao_alvo, excluir)
+        if candidato is not None:
+            return candidato
+
+        if self.provider_fallback is not None and self.provider_fallback is not self.provider:
+            print(
+                f"⚠️ Provedor de mídia primário ({type(self.provider).__name__}) sem candidato "
+                f"contextual para este trecho; tentando {type(self.provider_fallback).__name__}."
+            )
+            candidato = self._tentar_contextual(self.provider_fallback, texto, duracao_alvo, excluir)
+            if candidato is not None:
+                return candidato
+
+        return None
+
+    def _tentar_contextual(
+        self, provider: MediaProvider, texto: str, duracao_alvo: float, excluir: set
+    ) -> Optional[str]:
+        try:
+            candidatos = list(provider.listar_videos_contextual(texto, duracao_alvo, excluir))
+        except Exception as err:
+            print(f"⚠️ {type(provider).__name__} falhou ao buscar B-roll contextual ({err}).")
+            return None
+        if not candidatos:
+            return None
+
+        no_historico = set(self._historico)
+        # Preserva a ordem de RELEVÂNCIA que o provider já calculou (score
+        # — ver `_pontuar_candidato_broll`); só usa o histórico persistente
+        # entre execuções + `excluir` (diversidade dentro deste Short)
+        # como desempate leve e estável, nunca reordenando por score.
+        ordem = sorted(
+            candidatos,
+            key=lambda item: item.caminho in no_historico or item.caminho in excluir,
+        )
+
+        tentativas = 0
+        for candidato in ordem:
+            if tentativas >= MEDIA_MAX_TENTATIVAS:
+                break
+            tentativas += 1
+            if provider.validar_video(candidato):
+                self._origem[candidato.caminho] = provider
+                return candidato.caminho
+            print(f"⚠️ Vídeo '{candidato.caminho}' não passou na validação; tentando outro.")
+
+        return None
 
     def escolher_imagem(self) -> str:
         """Preparado para uso futuro — ainda não consumido pelo pipeline
@@ -2891,16 +3204,36 @@ def _definir_segmentos_broll(
     return segmentos
 
 
+def _texto_do_segmento(segmento: Tuple[float, float], palavras: List["PalavraLegenda"]) -> str:
+    """Reconstrói o texto REALMENTE narrado dentro de um trecho de B-roll
+    `(inicio, fim)`, a partir das mesmas `PalavraLegenda` (com timestamp
+    por palavra) já produzidas por `transcrever_narracao()` — a estrutura
+    de segmentação que o projeto já possui (Fase 2, item 2: não duplica o
+    roteiro inteiro nem cria um segundo mecanismo de divisão).
+
+    Usa o INÍCIO da palavra (`palavra.start`) para decidir a que trecho
+    ela pertence — mesmo critério já usado por `_definir_segmentos_broll()`
+    para os pontos de corte, então uma palavra nunca "pertence" a um
+    trecho diferente do que aparece visualmente na tela naquele
+    instante."""
+    inicio, fim = segmento
+    palavras_do_trecho = [p.palavra for p in palavras if inicio <= p.start < fim]
+    return " ".join(palavras_do_trecho).strip()
+
+
 def _preparar_clip_de_fundo(
     caminho: str, duracao_alvo: float, clips_para_fechar: List
 ) -> VideoFileClip:
     """Abre um único vídeo de fundo e o prepara para entrar num trecho de
     B-roll: valida existência/abertura, dá loop se for mais curto que
-    `duracao_alvo`, corta para exatamente essa duração e redimensiona para
-    9:16. Lança `FundoInvalidoError` (nunca deixa uma exceção "crua" do
-    MoviePy escapar) para qualquer arquivo ausente/corrompido/com duração
-    inválida — o chamador (`_montar_fundo_multiplo`) decide o que fazer:
-    descartar e tentar outro candidato para o mesmo trecho."""
+    `duracao_alvo`, corta para exatamente essa duração (variando o ponto
+    inicial quando há folga — Fase 2, item 12: evita sempre usar os
+    primeiros segundos do vídeo, tipicamente intro/logo/frame estático) e
+    redimensiona para 9:16. Lança `FundoInvalidoError` (nunca deixa uma
+    exceção "crua" do MoviePy escapar) para qualquer arquivo
+    ausente/corrompido/com duração inválida — o chamador
+    (`_montar_fundo_multiplo`) decide o que fazer: descartar e tentar
+    outro candidato para o mesmo trecho."""
     if not os.path.exists(caminho):
         raise FundoInvalidoError(f"❌ Vídeo de fundo '{caminho}' não encontrado.")
     try:
@@ -2920,15 +3253,44 @@ def _preparar_clip_de_fundo(
         clips_para_fechar.append(clip_loop)
         clip = clip_loop
 
-    clip = clip.subclip(0, duracao_alvo)
+    ponto_inicial = _escolher_ponto_de_corte_temporal(clip.duration, duracao_alvo)
+    clip = clip.subclip(ponto_inicial, ponto_inicial + duracao_alvo)
     clip = _redimensionar_para_vertical(clip)
     return clip
+
+
+def _escolher_ponto_de_corte_temporal(duracao_origem: float, duracao_alvo: float) -> float:
+    """Decide onde COMEÇAR o corte de `duracao_alvo` segundos dentro de um
+    vídeo de origem com `duracao_origem` segundos (Fase 2, item 12).
+
+    Se a folga (origem - alvo) for pequena (< `BROLL_FOLGA_MINIMA_PARA_VARIAR_INICIO`),
+    mantém o comportamento de sempre (começa em 0s) — não vale a pena
+    arriscar um recorte estranho por uma folga de frações de segundo.
+
+    Se houver folga confortável, sorteia um ponto dentro dela, mas SEMPRE
+    reservando uma margem nas duas pontas (mínimo entre metade da folga e
+    8% da duração total) para reduzir a chance de cair bem em cima de uma
+    transição de corte, logo/marca d'água de abertura ou frame estático
+    de encerramento — comuns nos primeiros/últimos segundos de clipes de
+    banco de imagens."""
+    folga = duracao_origem - duracao_alvo
+    if folga <= BROLL_FOLGA_MINIMA_PARA_VARIAR_INICIO:
+        return 0.0
+
+    margem = min(folga * 0.5, duracao_origem * 0.08)
+    inicio_maximo = max(0.0, folga - margem)
+    inicio_minimo = min(margem, inicio_maximo)
+    if inicio_maximo <= inicio_minimo:
+        return 0.0
+    return random.uniform(inicio_minimo, inicio_maximo)
 
 
 def _montar_fundo_multiplo(
     segmentos: List[Tuple[float, float]],
     caminhos_disponiveis: List[str],
     grupos: List[List["PalavraLegenda"]],
+    palavras: List["PalavraLegenda"],
+    roteiro_completo: str,
     clips_para_fechar: List,
     media_manager: Optional["MediaManager"],
 ) -> Tuple[VideoClip, List[str]]:
@@ -2938,15 +3300,25 @@ def _montar_fundo_multiplo(
     próprio zoom/pan contínuo, então a troca de vídeo já é, por si só, uma
     "cena nova" visualmente, sem precisar de nenhuma transição adicional.
 
-    Faz rodízio pelos caminhos em `caminhos_disponiveis` (um por trecho,
-    ciclando se houver menos vídeos que trechos) e evita repetir o MESMO
+    Fase 2 (B-roll contextual): para cada trecho, primeiro tenta um
+    candidato relevante para o texto REALMENTE narrado naquele trecho
+    (`media_manager.escolher_video_contextual`, via `_texto_do_segmento`).
+    Só se isso falhar (sem `media_manager`, sem candidato contextual, ou o
+    candidato contextual não abrir de verdade) cai para o rodízio pelos
+    caminhos em `caminhos_disponiveis` — o mesmo pool de reserva pré-
+    buscado pela Fase 4/`escolher_fundo_e_criar_video()`, que continua
+    existindo exatamente como antes para garantir que o pipeline nunca
+    fique sem fundo só porque a busca contextual não achou nada (item 21
+    da Fase 2: resiliência é requisito absoluto). Evita repetir o MESMO
     vídeo do trecho imediatamente anterior sempre que houver mais de uma
-    opção disponível. Se um vídeo falhar ao abrir para um trecho
-    específico, descarta e tenta o próximo candidato (até
-    `BROLL_MAX_TENTATIVAS_POR_SEGMENTO` alternativas) antes de reaproveitar
-    o ÚLTIMO trecho que funcionou — nunca derruba o vídeo inteiro por
-    causa de um único arquivo ruim que passou pela validação leve mas
-    falhou de verdade aqui (Fase 5/8).
+    opção disponível.
+
+    Se um vídeo falhar ao abrir para um trecho específico, descarta e
+    tenta o próximo candidato (contextual restante, depois pool de
+    reserva — até `BROLL_MAX_TENTATIVAS_POR_SEGMENTO` alternativas) antes
+    de reaproveitar o ÚLTIMO trecho que funcionou — nunca derruba o vídeo
+    inteiro por causa de um único arquivo ruim que passou pela validação
+    leve mas falhou de verdade aqui (Fase 5/8).
 
     Retorna o clip de fundo final (mesma duração da soma dos trechos) e a
     lista de caminhos REALMENTE usados — usada por
@@ -2973,16 +3345,37 @@ def _montar_fundo_multiplo(
             grupo[0].start - inicio for grupo in grupos if inicio < grupo[0].start < fim
         ]
 
+        texto_trecho = _texto_do_segmento((inicio, fim), palavras) or roteiro_completo
+        print(
+            f"🎞️ B-roll {indice_segmento + 1}/{len(segmentos)}\n"
+            f"📝 Texto: \"{texto_trecho[:100]}{'…' if len(texto_trecho) > 100 else ''}\""
+        )
+
+        fila_candidatos: List[str] = []
+        if media_manager is not None:
+            candidato_contextual = media_manager.escolher_video_contextual(
+                texto=texto_trecho,
+                duracao_alvo=duracao_segmento,
+                excluir=set(caminhos_usados),
+            )
+            if candidato_contextual:
+                fila_candidatos.append(candidato_contextual)
+            else:
+                print("⚠️ Nenhum candidato contextual relevante. ↩️ Usando pool de reserva.")
+
         candidato_ok: Optional[str] = None
         ultima_falha: Optional[Exception] = None
         tentativas_restantes = max(1, BROLL_MAX_TENTATIVAS_POR_SEGMENTO)
 
         while tentativas_restantes > 0 and candidato_ok is None:
-            caminho = caminhos_disponiveis[indice_pool % len(caminhos_disponiveis)]
-            indice_pool += 1
-            if caminho == ultimo_caminho_ok and len(caminhos_disponiveis) > 1:
+            if fila_candidatos:
+                caminho = fila_candidatos.pop(0)
+            else:
                 caminho = caminhos_disponiveis[indice_pool % len(caminhos_disponiveis)]
                 indice_pool += 1
+                if caminho == ultimo_caminho_ok and len(caminhos_disponiveis) > 1:
+                    caminho = caminhos_disponiveis[indice_pool % len(caminhos_disponiveis)]
+                    indice_pool += 1
 
             try:
                 clip_bruto = _preparar_clip_de_fundo(caminho, duracao_segmento, clips_para_fechar)
@@ -3042,16 +3435,21 @@ def criar_video(
 ) -> Tuple[str, List[str]]:
     """Monta o vídeo final: fundo dinâmico com MÚLTIPLOS B-rolls (Fase 4 —
     um vídeo diferente por trecho da narração, cada um com seu próprio Ken
-    Burns), legendas, barra de progresso, vinheta e fades, cortado em
-    9:16.
+    Burns; Fase 2 — cada trecho busca B-roll relevante ao texto REALMENTE
+    narrado ali, via `media_manager`), legendas, barra de progresso,
+    vinheta e fades, cortado em 9:16.
 
-    `caminhos_video_fundo` é a lista de candidatos de fundo já
-    escolhidos/validados por `escolher_fundo_e_criar_video()` — a
-    quantidade de B-rolls REALMENTE usados depende da duração da narração
-    (ver `_definir_segmentos_broll()`) e pode ser menor que
-    `len(caminhos_video_fundo)` (sobra não é desperdiçada, só não é
-    necessária) ou reaproveitar algum candidato mais de uma vez (se a
-    narração tiver mais trechos que vídeos disponíveis).
+    `caminhos_video_fundo` é o POOL DE RESERVA (Fase 4/Fase 2): candidatos
+    já escolhidos/validados por `escolher_fundo_e_criar_video()` a partir
+    do roteiro inteiro, usados como fallback quando a busca contextual por
+    trecho (Fase 2, via `media_manager`) não encontra nada relevante para
+    aquele trecho especificamente — nunca a fonte primária quando
+    `media_manager` está disponível. A quantidade de B-rolls REALMENTE
+    usados depende da duração da narração (ver `_definir_segmentos_broll()`)
+    e pode ser menor que `len(caminhos_video_fundo)` (sobra não é
+    desperdiçada, só não é necessária) ou reaproveitar algum candidato
+    mais de uma vez (se a narração tiver mais trechos que vídeos
+    disponíveis).
 
     Retorna `(caminho_do_arquivo_final, caminhos_de_fundo_realmente_usados)`
     — o segundo item é repassado a `MediaManager.confirmar_uso()` para só
@@ -3111,8 +3509,11 @@ def criar_video(
         # Fundo dinâmico: um B-roll por trecho (Fase 4), cada um com zoom
         # lento contínuo + variação de zoom a cada grupo de legenda + leve
         # pan, sempre dentro dos limites da imagem (sem bordas pretas).
+        # Fase 2: cada trecho busca B-roll relevante ao texto REALMENTE
+        # narrado ali (`palavras`), com o pool `caminhos_video_fundo`
+        # (pré-buscado a partir do roteiro inteiro) como reserva.
         fundo_dinamico, caminhos_usados = _montar_fundo_multiplo(
-            segmentos, caminhos_video_fundo, grupos, clips_para_fechar, media_manager
+            segmentos, caminhos_video_fundo, grupos, palavras, roteiro_completo, clips_para_fechar, media_manager
         )
         _debug_registrar("05_ken_burns", fundo_dinamico)
 
@@ -3247,10 +3648,18 @@ def escolher_fundo_e_criar_video(roteiro: str, caminho_audio: str, media_manager
     `media_manager.escolher_videos(contexto=roteiro, quantidade=BROLL_MAX_SEGMENTOS)`
     — o roteiro é passado como contexto para que um provider remoto
     (Pexels) possa gerar queries visuais de busca a partir dele; providers
-    locais o ignoram. A quantidade exata de trechos de B-roll só é
-    conhecida depois da transcrição (dentro de `criar_video()`), então
-    pede-se aqui um teto generoso; sobra não é desperdício, só não é
-    necessária.
+    locais o ignoram.
+
+    Desde a Fase 2, este pool NÃO é mais a fonte primária de B-roll: serve
+    como RESERVA dentro de `criar_video()`/`_montar_fundo_multiplo()`, que
+    agora busca um candidato contextual (relevante ao texto de CADA
+    trecho) primeiro, e só cai para este pool se a busca contextual não
+    achar nada para aquele trecho específico — mantendo o pipeline
+    resiliente mesmo se o texto do trecho vier vazio ou a busca contextual
+    falhar por completo (item 21 da Fase 2). A quantidade exata de trechos
+    de B-roll só é conhecida depois da transcrição (dentro de
+    `criar_video()`), então pede-se aqui um teto generoso; sobra não é
+    desperdício, só não é necessária.
 
     O histórico só é atualizado (`media_manager.confirmar_uso()`) DEPOIS
     que `criar_video()` retorna com sucesso, e SÓ para os vídeos que
@@ -3258,10 +3667,11 @@ def escolher_fundo_e_criar_video(roteiro: str, caminho_audio: str, media_manager
     nunca no momento da escolha, e nunca para candidatos que sobraram sem
     uso. Se NENHUM dos candidatos funcionar durante a renderização de
     verdade (`FundoInvalidoError` — o que já é raro, já que
-    `_montar_fundo_multiplo()` tenta várias alternativas e reaproveita o
-    último B-roll que funcionou por trecho), descarta todos os candidatos
-    desta tentativa e pede um novo pool, até `MEDIA_MAX_TENTATIVAS` —
-    nunca derruba o workflow por causa de vídeos ruins.
+    `_montar_fundo_multiplo()` tenta várias alternativas — contextual e de
+    reserva — e reaproveita o último B-roll que funcionou por trecho),
+    descarta todos os candidatos desta tentativa e pede um novo pool, até
+    `MEDIA_MAX_TENTATIVAS` — nunca derruba o workflow por causa de vídeos
+    ruins.
     """
     ultimo_erro: Optional[Exception] = None
 
