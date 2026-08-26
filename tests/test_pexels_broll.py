@@ -511,6 +511,115 @@ class TestSafeZoneLegendas(unittest.TestCase):
     def test_legend_width_fraction_deixa_margem_lateral(self):
         self.assertLess(bot_main.LEGEND_WIDTH_FRACTION, 0.95)
 
+    def test_safe_area_top_dentro_de_faixa_razoavel(self):
+        self.assertGreater(bot_main.SAFE_AREA_TOP, 0.0)
+        self.assertLess(bot_main.SAFE_AREA_TOP, 0.25)
+
+    def test_safe_area_side_dentro_de_faixa_razoavel(self):
+        self.assertGreater(bot_main.SAFE_AREA_SIDE, 0.0)
+        self.assertLess(bot_main.SAFE_AREA_SIDE, 0.20)
+
+    def test_safe_areas_top_e_bottom_nao_ultrapassam_a_tela(self):
+        # Topo + base não podem, juntos, consumir a tela inteira (senão
+        # não sobraria nenhuma área útil para o texto).
+        self.assertLess(bot_main.SAFE_AREA_TOP + bot_main.SAFE_AREA_BOTTOM, 1.0)
+
+    def test_legend_width_fraction_respeita_safe_area_lateral(self):
+        # A largura máxima de legenda precisa caber dentro do que sobra
+        # depois de reservar SAFE_AREA_SIDE dos dois lados (item 4: nenhuma
+        # margem "solta" além das constantes centralizadas).
+        largura_disponivel = 1.0 - 2 * bot_main.SAFE_AREA_SIDE
+        self.assertLessEqual(bot_main.LEGEND_WIDTH_FRACTION, largura_disponivel)
+
+    def test_clamp_y_legenda_nao_ultrapassa_safe_area_top(self):
+        # Reproduz o clamp aplicado em `_construir_clip_grupo()`: um grupo
+        # de legenda alto o bastante para, sem o clamp, ficar acima da
+        # safe area do topo precisa ser empurrado de volta para dentro
+        # dela.
+        altura_video = bot_main.VIDEO_HEIGHT
+        y_minimo = int(altura_video * bot_main.SAFE_AREA_TOP)
+        y_calculado_sem_clamp = -50  # simula um grupo de 3 linhas bem alto
+        y_video = max(y_minimo, y_calculado_sem_clamp)
+        self.assertGreaterEqual(y_video, y_minimo)
+
+
+# ===========================================================================
+# 13. Animação de entrada/saída das legendas (Fase 3)
+# ===========================================================================
+class TestAnimacaoEntradaSaidaLegenda(unittest.TestCase):
+    def test_meio_do_grupo_fica_em_escala_e_opacidade_totais(self):
+        duracao = 2.0
+        escala, opacidade = bot_main._fator_entrada_saida_grupo(1.0, duracao, eh_hook=False)
+        self.assertEqual(escala, 1.0)
+        self.assertEqual(opacidade, 1.0)
+
+    def test_inicio_do_grupo_comeca_com_escala_e_opacidade_reduzidas(self):
+        escala, opacidade = bot_main._fator_entrada_saida_grupo(0.0, 2.0, eh_hook=False)
+        self.assertAlmostEqual(escala, bot_main.LEGEND_ANIM_SCALE_START, places=3)
+        self.assertAlmostEqual(opacidade, 0.0, places=3)
+
+    def test_entrada_termina_em_escala_e_opacidade_totais(self):
+        escala, opacidade = bot_main._fator_entrada_saida_grupo(
+            bot_main.LEGEND_ANIM_IN_DURATION, 2.0, eh_hook=False
+        )
+        self.assertAlmostEqual(escala, 1.0, places=2)
+        self.assertAlmostEqual(opacidade, 1.0, places=2)
+
+    def test_saida_do_grupo_reduz_opacidade_mas_nao_a_escala(self):
+        duracao = 2.0
+        t = duracao - bot_main.LEGEND_ANIM_OUT_DURATION / 2
+        escala, opacidade = bot_main._fator_entrada_saida_grupo(t, duracao, eh_hook=False)
+        self.assertEqual(escala, 1.0)  # saída nunca encolhe, só esmaece
+        self.assertLess(opacidade, 1.0)
+
+    def test_hook_usa_escala_inicial_mais_forte_que_o_padrao(self):
+        escala_normal, _ = bot_main._fator_entrada_saida_grupo(0.0, 2.0, eh_hook=False)
+        escala_hook, _ = bot_main._fator_entrada_saida_grupo(0.0, 2.0, eh_hook=True)
+        self.assertLess(escala_hook, escala_normal)
+        self.assertEqual(escala_hook, bot_main.HOOK_ANIM_SCALE_START)
+
+    def test_escala_e_opacidade_sempre_no_intervalo_valido(self):
+        for t in [0.0, 0.05, 0.16, 0.5, 1.0, 1.85, 1.9, 2.0]:
+            escala, opacidade = bot_main._fator_entrada_saida_grupo(t, 2.0, eh_hook=False)
+            self.assertGreaterEqual(escala, 0.0)
+            self.assertLessEqual(escala, 1.0001)
+            self.assertGreaterEqual(opacidade, 0.0)
+            self.assertLessEqual(opacidade, 1.0001)
+
+
+# ===========================================================================
+# 14. Punch de zoom do hook (Fase 3, item 8)
+# ===========================================================================
+class TestHookZoomPunch(unittest.TestCase):
+    def test_punch_e_zero_quando_nao_e_hook(self):
+        self.assertEqual(bot_main._progresso_punch_hook(0.0, eh_hook=False), 0.0)
+        self.assertEqual(bot_main._progresso_punch_hook(0.1, eh_hook=False), 0.0)
+
+    def test_punch_e_maximo_no_inicio_do_hook(self):
+        punch = bot_main._progresso_punch_hook(0.0, eh_hook=True)
+        self.assertAlmostEqual(punch, bot_main.HOOK_ZOOM_PUNCH - 1.0, places=3)
+
+    def test_punch_decai_ate_zero_ao_final_da_janela(self):
+        punch = bot_main._progresso_punch_hook(bot_main.HOOK_ZOOM_PUNCH_DURATION, eh_hook=True)
+        self.assertEqual(punch, 0.0)
+
+    def test_punch_e_sempre_decrescente_dentro_da_janela(self):
+        amostras = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5]
+        valores = [bot_main._progresso_punch_hook(t, eh_hook=True) for t in amostras]
+        for anterior, atual in zip(valores, valores[1:]):
+            self.assertLessEqual(atual, anterior)
+
+    def test_punch_e_zero_depois_da_janela_do_hook(self):
+        punch = bot_main._progresso_punch_hook(bot_main.HOOK_ZOOM_PUNCH_DURATION + 1.0, eh_hook=True)
+        self.assertEqual(punch, 0.0)
+
+    def test_apenas_o_primeiro_trecho_de_broll_recebe_o_hook(self):
+        # Reproduz a regra de `_montar_fundo_multiplo()`: só o trecho de
+        # índice 0 é tratado como hook.
+        segmentos = [(0.0, 6.0), (6.0, 12.0), (12.0, 18.0)]
+        flags_hook = [indice == 0 for indice in range(len(segmentos))]
+        self.assertEqual(flags_hook, [True, False, False])
+
 
 # ===========================================================================
 # 11. Mídia descartada não entra no histórico

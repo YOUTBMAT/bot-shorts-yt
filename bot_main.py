@@ -232,15 +232,45 @@ STROKE_COLOR: str = "black"
 STROKE_WIDTH: int = 3
 LEGEND_SHADOW_OFFSET: Tuple[int, int] = (3, 4)  # deslocamento (x, y) da sombra em px
 LEGEND_SHADOW_OPACITY: float = 0.45
-LEGEND_WIDTH_FRACTION: float = 0.82  # largura máxima da área de legenda
+LEGEND_WIDTH_FRACTION: float = 0.82  # largura máxima da área de legenda (< 1 - 2*SAFE_AREA_SIDE, ver seção "Safe area" abaixo)
 LEGEND_WORD_SPACING: int = 18  # espaço horizontal (px) entre palavras
 LEGEND_LINE_SPACING: int = 12  # espaço vertical (px) entre linhas, se o grupo quebrar em 2
-SAFE_AREA_BOTTOM: float = 0.20  # fração da tela reservada na base (fora da legenda)
 POP_SCALE: float = 1.08  # escala máxima do "pop" da palavra ativa (100% -> 108% -> 100%)
 POP_DURATION: float = 0.22  # duração do pop, em segundos, ao ativar uma palavra
 MIN_GROUP_WORDS: int = 3
 MAX_GROUP_WORDS: int = 5
 PAUSA_MINIMA_QUEBRA: float = 0.35  # segundos; pausa que sugere quebra natural de grupo
+
+# --- Safe area (Fase 3) ---
+# Todas as margens de segurança do Short centralizadas aqui, como frações
+# da tela (0 a 1). Nenhum outro ponto do código deve definir uma margem
+# de segurança "solta" — quem precisar de uma referência de posição usa
+# estas constantes. Valores pensados para a UI real do YouTube Shorts:
+# o topo costuma ter o nome do canal/ícones, a base tem título, botão de
+# inscrição e a barra de descrição, e a lateral direita tem a coluna de
+# curtir/comentar/compartilhar.
+SAFE_AREA_TOP: float = 0.10     # topo: evita colidir com barra de progresso/notificações do app
+SAFE_AREA_BOTTOM: float = 0.20  # base: evita título, inscrever-se e a barra de descrição do Shorts
+SAFE_AREA_SIDE: float = 0.06    # laterais: evita a coluna de curtir/comentar/compartilhar à direita
+
+# --- Animação de entrada/saída das legendas (Fase 3) ---
+# Cada grupo de legenda entra com um fade + leve "scale-in" (nunca um
+# bounce) e sai com um fade curto — sutil o bastante para não competir
+# com o "pop" da palavra ativa, que continua acontecendo por cima disso.
+LEGEND_ANIM_IN_DURATION: float = 0.16   # segundos; duração da entrada (fade + scale)
+LEGEND_ANIM_OUT_DURATION: float = 0.12  # segundos; duração da saída (só fade, sem encolher)
+LEGEND_ANIM_SCALE_START: float = 0.92   # escala inicial do "scale-in" padrão (92% -> 100%)
+
+# --- Hook (Fase 3) ---
+# Tratamento visual especial só para o PRIMEIRO grupo de legenda/trecho de
+# B-roll do vídeo (os primeiros segundos, decisivos para retenção em
+# Shorts): entrada de legenda um pouco mais pronunciada e um "punch" de
+# zoom rápido no B-roll, que se resolve em `HOOK_ZOOM_PUNCH_DURATION`
+# segundos — depois disso, o hook segue exatamente o mesmo Ken Burns
+# contínuo do restante do vídeo.
+HOOK_ANIM_SCALE_START: float = 0.86    # entrada do hook (mais forte que o padrão, ainda sem bounce)
+HOOK_ZOOM_PUNCH: float = 1.06          # zoom extra somado só no início do primeiro B-roll
+HOOK_ZOOM_PUNCH_DURATION: float = 0.6  # segundos; janela em que o "punch" decai até zero
 
 # --- Edição dinâmica de vídeo (Ken Burns / zoom / pan) ---
 KEN_BURNS_ZOOM_MAX: float = 1.03  # zoom lento e contínuo ao longo do vídeo inteiro
@@ -2460,6 +2490,52 @@ def _ease_suave(x: float) -> float:
     return x * x * (3.0 - 2.0 * x)
 
 
+def _progresso_punch_hook(t: float, eh_hook: bool) -> float:
+    """Calcula o "punch" de zoom extra (Fase 3, item 8 — hook) somado ao
+    fator de zoom normal do Ken Burns, só para `eh_hook=True` e só dentro
+    dos primeiros `HOOK_ZOOM_PUNCH_DURATION` segundos do trecho.
+
+    Decai suavemente (`_ease_suave`) de `HOOK_ZOOM_PUNCH - 1.0` até 0 — uma
+    entrada rápida e visualmente forte que se resolve no Ken Burns
+    contínuo normal, em vez de um zoom constante o vídeo inteiro. Fora
+    dessa janela (ou quando `eh_hook=False`), o retorno é sempre 0.0 e o
+    Ken Burns se comporta exatamente como antes.
+    """
+    if not eh_hook or t >= HOOK_ZOOM_PUNCH_DURATION or t < 0:
+        return 0.0
+    progresso_restante = 1.0 - _ease_suave(t / HOOK_ZOOM_PUNCH_DURATION)
+    return (HOOK_ZOOM_PUNCH - 1.0) * progresso_restante
+
+
+def _fator_entrada_saida_grupo(t: float, duracao_grupo: float, eh_hook: bool) -> Tuple[float, float]:
+    """Calcula (escala, opacidade) da animação de entrada/saída de UM grupo
+    de legenda (Fase 3, item 7), em função do tempo relativo `t` (0 =
+    início do grupo) e da duração total do grupo em tela.
+
+    Entrada: fade + "scale-in" suave (escala inicial menor, sobe até 100%
+    junto com a opacidade) — mais pronunciada no hook
+    (`HOOK_ANIM_SCALE_START` < `LEGEND_ANIM_SCALE_START`), conforme pedido
+    no item 8 (tratamento especial dos primeiros segundos). Saída: só
+    fade (a escala permanece 100%) — encolher na saída lê como "erro de
+    render" mais do que como uma transição intencional. Fora das duas
+    janelas, devolve (1.0, 1.0): nenhum custo extra por frame no meio da
+    exibição do grupo, que é a maior parte do tempo.
+    """
+    escala_inicial = HOOK_ANIM_SCALE_START if eh_hook else LEGEND_ANIM_SCALE_START
+
+    if t < LEGEND_ANIM_IN_DURATION:
+        progresso = _ease_suave(max(0.0, t) / LEGEND_ANIM_IN_DURATION)
+        escala = escala_inicial + (1.0 - escala_inicial) * progresso
+        return escala, progresso
+
+    tempo_restante = duracao_grupo - t
+    if tempo_restante < LEGEND_ANIM_OUT_DURATION:
+        progresso = _ease_suave(max(0.0, tempo_restante) / LEGEND_ANIM_OUT_DURATION)
+        return 1.0, progresso
+
+    return 1.0, 1.0
+
+
 def _sequencia_zoom_por_bloco(quantidade_blocos: int) -> List[float]:
     """Gera uma sequência de níveis de zoom que nunca repete o valor anterior."""
     sequencia: List[float] = []
@@ -2478,8 +2554,15 @@ def _aplicar_ken_burns(
     clip: VideoFileClip,
     duracao_total: float,
     pontos_de_corte: List[float],
+    eh_hook: bool = False,
 ) -> VideoClip:
     """Aplica um efeito Ken Burns sutil: zoom lento contínuo + zoom por segmento.
+
+    `eh_hook=True` (Fase 3, item 8) soma um "punch" de zoom extra e rápido
+    nos primeiros `HOOK_ZOOM_PUNCH_DURATION` segundos — ver
+    `_progresso_punch_hook()`. Usado só no primeiro trecho de B-roll do
+    vídeo; em todos os outros trechos o comportamento é idêntico ao de
+    antes desta fase.
 
     IMPLEMENTAÇÃO AUTO-CONTIDA (reescrita após um bug de renderização): em
     vez de usar `.resize()` + `.set_position()` compostos dentro de um
@@ -2540,7 +2623,8 @@ def _aplicar_ken_burns(
 
         progresso_geral = _ease_suave(min(t / duracao_total, 1.0)) if duracao_total > 0 else 0.0
         zoom_lento = 1.0 + (KEN_BURNS_ZOOM_MAX - 1.0) * progresso_geral
-        return max(1.0, 1.0 + (zoom_bloco - 1.0) + (zoom_lento - 1.0))
+        punch_hook = _progresso_punch_hook(t, eh_hook)
+        return max(1.0, 1.0 + (zoom_bloco - 1.0) + (zoom_lento - 1.0) + punch_hook)
 
     def make_frame(t: float) -> np.ndarray:
         frame_original = clip.get_frame(t)
@@ -2902,7 +2986,7 @@ def _desenhar_grupo(
 
 
 def _construir_clip_grupo(
-    grupo: List[PalavraLegenda], largura_video: int, altura_video: int
+    grupo: List[PalavraLegenda], largura_video: int, altura_video: int, eh_hook: bool = False
 ) -> VideoClip:
     """Constrói UM único VideoClip dinâmico para o grupo inteiro.
 
@@ -2910,6 +2994,10 @@ def _construir_clip_grupo(
     grupo inteiro vira um único clip cujo `make_frame` compõe os tiles já
     cacheados a cada quadro — poucos objetos MoviePy na composição final,
     menos overhead de renderização.
+
+    `eh_hook=True` (Fase 3, item 8) só afeta o PRIMEIRO grupo do vídeo: a
+    animação de entrada usa `HOOK_ANIM_SCALE_START` em vez de
+    `LEGEND_ANIM_SCALE_START` — ver `_fator_entrada_saida_grupo()`.
     """
     largura_maxima = int(largura_video * LEGEND_WIDTH_FRACTION)
     layout, altura_linha, num_linhas = _calcular_layout_grupo(grupo, largura_maxima)
@@ -2936,6 +3024,25 @@ def _construir_clip_grupo(
             frame = np.zeros((altura_total, largura_maxima, 3), dtype=np.uint8)
             alpha = np.zeros((altura_total, largura_maxima), dtype=np.float32)
             _desenhar_grupo(frame, alpha, layout, t_abs)
+
+            # Animação de entrada/saída do grupo inteiro (Fase 3, item 7):
+            # fade + scale-in centralizado no próprio canvas do grupo, sem
+            # mexer no layout/posição das palavras (que continua fixo,
+            # calculado uma única vez em `_calcular_layout_grupo`). Fora
+            # das janelas de entrada/saída, `escala == opacidade == 1.0` e
+            # o custo extra é só a checagem — nenhum resize/blend a mais.
+            escala, opacidade = _fator_entrada_saida_grupo(t, duracao_grupo, eh_hook)
+            if escala < 0.999 or opacidade < 0.999:
+                frame_escalado, alpha_escalado = _escalar_tile(frame, alpha, escala)
+                frame = np.zeros_like(frame)
+                alpha = np.zeros_like(alpha)
+                h_s, w_s = alpha_escalado.shape
+                x_off = (largura_maxima - w_s) // 2
+                y_off = (altura_total - h_s) // 2
+                _colar_tile(frame, alpha, frame_escalado, alpha_escalado, x_off, y_off)
+                if opacidade < 1.0:
+                    alpha = alpha * opacidade
+
             _ultimo_quadro["t"] = t
             _ultimo_quadro["frame"] = frame
             _ultimo_quadro["alpha"] = alpha
@@ -2953,11 +3060,18 @@ def _construir_clip_grupo(
     clip_mascara = VideoClip(make_frame=make_mask, duration=duracao_grupo, ismask=True)
     clip_video = clip_video.set_mask(clip_mascara)
 
-    # Posição fixa (safe area): a base do bloco de legenda sempre no mesmo
-    # lugar, longe da borda inferior — nunca cobre elementos do Shorts nem
-    # "pula" de posição entre grupos.
+    # Posição fixa (safe area, Fase 3, item 4): a base do bloco de legenda
+    # sempre no mesmo lugar, longe da borda inferior — nunca cobre
+    # elementos do Shorts nem "pula" de posição entre grupos.
+    # `largura_maxima` já usa LEGEND_WIDTH_FRACTION < 1 - 2*SAFE_AREA_SIDE,
+    # então fica centralizado dentro da margem lateral segura por
+    # construção. O clamp em y_minimo é a defesa para o caso raro de um
+    # grupo grande demais (3 linhas) empurrar o bloco para cima do que
+    # SAFE_AREA_TOP permite.
     x_video = (largura_video - largura_maxima) // 2
     y_video = altura_video - int(altura_video * SAFE_AREA_BOTTOM) - altura_total
+    y_minimo = int(altura_video * SAFE_AREA_TOP)
+    y_video = max(y_minimo, y_video)
     clip_video = clip_video.set_start(inicio_grupo).set_position((x_video, y_video))
 
     return clip_video
@@ -2965,8 +3079,12 @@ def _construir_clip_grupo(
 
 def _criar_clips_de_legenda(grupos: List[List[PalavraLegenda]], largura_video: int, altura_video: int) -> List[VideoClip]:
     """Constrói o clip dinâmico de cada grupo e devolve a lista pronta para
-    entrar na composição final."""
-    return [_construir_clip_grupo(grupo, largura_video, altura_video) for grupo in grupos]
+    entrar na composição final. Só o PRIMEIRO grupo (`eh_hook=True`, Fase
+    3, item 8) recebe a entrada de legenda mais pronunciada do hook."""
+    return [
+        _construir_clip_grupo(grupo, largura_video, altura_video, eh_hook=(indice == 0))
+        for indice, grupo in enumerate(grupos)
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -3391,7 +3509,9 @@ def _montar_fundo_multiplo(
                 continue
 
             candidato_ok = caminho
-            clip_segmento = _aplicar_ken_burns(clip_bruto, duracao_segmento, pontos_locais)
+            clip_segmento = _aplicar_ken_burns(
+                clip_bruto, duracao_segmento, pontos_locais, eh_hook=(indice_segmento == 0)
+            )
             clips_para_fechar.append(clip_segmento)
             clips_segmento.append(clip_segmento)
             caminhos_usados.append(caminho)
@@ -3408,7 +3528,9 @@ def _montar_fundo_multiplo(
                 f"para o trecho {indice_segmento + 1}/{len(segmentos)}."
             )
             clip_bruto = _preparar_clip_de_fundo(ultimo_caminho_ok, duracao_segmento, clips_para_fechar)
-            clip_segmento = _aplicar_ken_burns(clip_bruto, duracao_segmento, pontos_locais)
+            clip_segmento = _aplicar_ken_burns(
+                clip_bruto, duracao_segmento, pontos_locais, eh_hook=(indice_segmento == 0)
+            )
             clips_para_fechar.append(clip_segmento)
             clips_segmento.append(clip_segmento)
             caminhos_usados.append(ultimo_caminho_ok)
@@ -3585,6 +3707,14 @@ def criar_video(
         taxa_cache = (_estatisticas_cache["acertos"] / total_consultas * 100) if total_consultas else 0.0
         print(f"✨ {len(palavras)} animações")
         print(f"⚡ Cache reutilizado: {taxa_cache:.0f}% ({total_tiles} tiles únicos renderizados)")
+        print(
+            "🎨 Visual\n"
+            f"- resolução: {largura_final}x{altura_final}\n"
+            f"- legendas: OK ({len(grupos)} grupo(s))\n"
+            f"- safe area: OK (topo {SAFE_AREA_TOP:.0%} / base {SAFE_AREA_BOTTOM:.0%} / lateral {SAFE_AREA_SIDE:.0%})\n"
+            f"- B-roll: {len(segmentos)} cena(s)\n"
+            f"- animações: {len(palavras)}"
+        )
 
         video_final = CompositeVideoClip(
             [fundo_com_vinheta] + text_clips + [barra_progresso],
