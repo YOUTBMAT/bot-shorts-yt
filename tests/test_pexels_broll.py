@@ -251,6 +251,121 @@ class TestQueriesVisuais(unittest.TestCase):
 
 
 # ===========================================================================
+# 1.1 Query semântica contextual (Fase 2.1)
+# ===========================================================================
+class TestQueriesVisuaisSemanticas(unittest.TestCase):
+    """Cobre a auditoria de qualidade de queries pedida na Fase 2.1: um
+    trecho sem entidade nomeada não pode mais produzir palavras soltas em
+    português como query ('estamos', 'corpo', 'morte'...) — ver
+    `CONCEITOS_CONTEXTUAIS_PT_EN` / `_gerar_queries_visuais()`."""
+
+    def setUp(self):
+        self.provider = bot_main.PexelsMediaProvider.__new__(bot_main.PexelsMediaProvider)
+
+    # --- Teste 1: palavras inúteis não viram query isolada ---------------
+    def test_palavras_de_discurso_nunca_viram_query(self):
+        texto = "Nao estamos falando de um monstro de filme."
+        queries = self.provider._gerar_queries_visuais(texto)
+        texto_unido = " ".join(queries).lower()
+        for palavra_proibida in ("estamos", "falando", "filme"):
+            self.assertNotIn(palavra_proibida, texto_unido)
+
+    # --- Teste 2: entidade (Cachalote) ------------------------------------
+    def test_cachalote_gera_conceitos_de_baleia_e_ecolocalizacao(self):
+        texto = "A Cachalote consegue emitir cliques sonoros."
+        queries = self.provider._gerar_queries_visuais(texto)
+        texto_unido = " ".join(queries).lower()
+        self.assertIn("sperm whale", texto_unido)
+        self.assertTrue("whale" in texto_unido and "echolocation" in texto_unido)
+
+    # --- Teste 3: contexto sem entidade nomeada ---------------------------
+    def test_criatura_sem_nome_usa_contexto_de_profundezas_do_mar(self):
+        texto = "uma criatura real que navega pelas profundezas"
+        queries = self.provider._gerar_queries_visuais(texto)
+        texto_unido = " ".join(queries).lower()
+        self.assertTrue(any(termo in texto_unido for termo in ("deep sea", "underwater", "marine")))
+        # nenhuma das palavras cruas em português deveria sobrar como query
+        for palavra_proibida in ("criatura", "real", "navega", "profundezas"):
+            self.assertNotIn(palavra_proibida, texto_unido)
+
+    # --- Teste 4: ação -----------------------------------------------------
+    def test_foguete_decolando_gera_rocket_launch(self):
+        texto = "um foguete decolando rumo ao espaco"
+        queries = self.provider._gerar_queries_visuais(texto)
+        texto_unido = " ".join(queries).lower()
+        self.assertIn("rocket launch", texto_unido)
+
+    # --- Teste 5: conceito composto (nunca palavra isolada genérica) -----
+    def test_animal_marinho_perigoso_gera_conceito_composto(self):
+        texto = "um animal marinho perigoso"
+        queries = self.provider._gerar_queries_visuais(texto)
+        for query in queries:
+            self.assertGreaterEqual(len(query.split()), 2)  # sempre multipalavra
+        self.assertNotIn("animal", queries)
+        self.assertNotIn("perigoso", queries)
+
+    # --- Teste 6: deduplicação --------------------------------------------
+    def test_queries_duplicadas_sao_removidas(self):
+        texto = "cachalote cachalote cachalote"
+        queries = self.provider._gerar_queries_visuais(texto)
+        self.assertEqual(len(queries), len(set(queries)))
+
+    # --- Teste 7: limite respeitado com entidade+conceito juntos ---------
+    def test_limite_maximo_respeitado_combinando_entidade_e_conceito(self):
+        texto = (
+            "cachalote baleia tubarao golfinho criatura perigoso profundezas "
+            "predador nadando atacando"
+        )
+        queries = self.provider._gerar_queries_visuais(texto)
+        self.assertLessEqual(len(queries), bot_main.MAX_PALAVRAS_CHAVE_PESQUISA)
+
+    # --- Teste 8: fallback quando não há candidato nenhum -----------------
+    def test_texto_sem_conceito_visual_usa_fallback_generico_composto(self):
+        texto = "isso porem tambem assim entao"  # só stopwords/conectivos
+        queries = self.provider._gerar_queries_visuais(texto)
+        self.assertTrue(len(queries) >= 1)
+        for query in queries:
+            self.assertIn(query, bot_main.PEXELS_QUERIES_FALLBACK_GENERICAS)
+
+    # --- Teste 9: acentuação não quebra o processamento --------------------
+    def test_acentos_nao_quebram_geracao_de_queries(self):
+        texto = "Cachalote no oceano, perto de um orgao vital, na agua profunda."
+        queries = self.provider._gerar_queries_visuais(texto)  # não deve lançar exceção
+        self.assertTrue(len(queries) >= 1)
+
+    # --- Teste 10: números não quebram o processamento ---------------------
+    def test_numeros_nao_quebram_geracao_de_queries(self):
+        texto = "230 dB e mais forte que qualquer som conhecido"
+        queries = self.provider._gerar_queries_visuais(texto)  # não deve lançar exceção
+        self.assertIsInstance(queries, list)
+
+    # --- Teste 11: texto vazio ----------------------------------------------
+    def test_texto_vazio_usa_fallback_seguro(self):
+        queries = self.provider._gerar_queries_visuais("")
+        self.assertTrue(len(queries) >= 1)
+        for query in queries:
+            self.assertIn(query, bot_main.PEXELS_QUERIES_FALLBACK_GENERICAS)
+
+    # --- Teste 12: texto muito curto ----------------------------------------
+    def test_texto_muito_curto_usa_fallback_seguro(self):
+        queries = self.provider._gerar_queries_visuais("e")
+        self.assertTrue(len(queries) >= 1)
+
+    # --- Extras: prioridade e composição ------------------------------------
+    def test_entidade_tem_prioridade_sobre_conceito_generico(self):
+        # "cachalote" (entidade) e "profundezas" (conceito) no mesmo
+        # trecho: a entidade, mais específica, deve aparecer nas queries.
+        texto = "o cachalote vive nas profundezas do oceano"
+        queries = self.provider._gerar_queries_visuais(texto)
+        texto_unido = " ".join(queries).lower()
+        self.assertIn("sperm whale", texto_unido)
+
+    def test_fallback_generico_nunca_contem_palavra_solta_em_portugues(self):
+        for query in bot_main.PEXELS_QUERIES_FALLBACK_GENERICAS:
+            self.assertGreaterEqual(len(query.split()), 2)
+
+
+# ===========================================================================
 # 2. Tratamento de status HTTP / timeout / JSON inválido no Pexels
 # ===========================================================================
 class TestPexelsBusca(unittest.TestCase):
