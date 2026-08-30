@@ -33,6 +33,7 @@ import json
 import os
 import random
 import sys
+import time
 import types
 import unittest
 import urllib.error
@@ -1432,6 +1433,228 @@ class TestEscolherVideoContextual(unittest.TestCase):
 #     `_verificar_fundo_saudavel()` — sem mudança de comportamento nesta
 #     fase, então sem testes novos aqui.
 # ===========================================================================
+
+
+# ===========================================================================
+# 23. Fase 2.1.1 — Diagnóstico do pipeline Pexels (auditoria).
+#
+# Cobre os 7 cenários pedidos no diagnóstico:
+#   1. API retorna 0 vídeos.
+#   2. API retorna vídeos, todos eliminados por filtros REAIS do código
+#      (duração / já descartado nesta execução / sem arquivo utilizável).
+#   3. API retorna candidato válido, que é baixado com sucesso.
+#   4. API retorna candidato válido, mas o download falha.
+#   5. Cache já tem o vídeo — não deve baixar de novo.
+#   6. HTTP 403 / Cloudflare 1010 — diagnóstico específico já existente
+#      continua funcionando.
+#   7. HTTP 429 — tratamento existente continua funcionando.
+#
+# Mais alguns testes de sanidade sobre o próprio mecanismo de diagnóstico
+# (tabela de scores, componentes batendo com o score final, e a chave da
+# API nunca vazando através do novo log da cascata).
+# ===========================================================================
+class TestDiagnosticoFase2_1_1(unittest.TestCase):
+    def setUp(self):
+        self.provider = bot_main.PexelsMediaProvider.__new__(bot_main.PexelsMediaProvider)
+        self.provider.api_key = "chave-de-teste"
+        self.provider.cache_dir = "/tmp/cache_teste_fase2_1_1"
+        self.provider.metadata_path = "/tmp/cache_teste_fase2_1_1/metadata.json"
+        self.provider._metadata = {}
+        self.provider._rejeitados_nesta_execucao = set()
+        self.provider._cache_busca_execucao = {}
+        self.provider._downloads_nesta_execucao = 0
+
+    def _video(self, video_id, duration=12, width=1920, height=1080):
+        return {
+            "id": video_id,
+            "duration": duration,
+            "width": width,
+            "height": height,
+            "video_files": [
+                {"width": width, "height": height, "fps": 30, "link": f"https://cdn/{video_id}.mp4"}
+            ],
+        }
+
+    def _saida_prints(self, mock_print) -> str:
+        return "\n".join(" ".join(str(a) for a in chamada.args) for chamada in mock_print.call_args_list)
+
+    # --- Cenário 1: API retorna 0 vídeos ----------------------------------
+    def test_cenario1_api_retorna_zero_videos(self):
+        resposta = mock.MagicMock()
+        resposta.read.return_value = json.dumps({"videos": []}).encode("utf-8")
+        resposta.__enter__.return_value = resposta
+        resposta.__exit__.return_value = False
+
+        with mock.patch("bot_main.urllib.request.urlopen", return_value=resposta), mock.patch(
+            "builtins.print"
+        ) as mock_print:
+            itens = self.provider._buscar_com_fallback_de_queries(
+                ["saturn rings"], duracao_alvo=6.0, ids_evitar=set()
+            )
+
+        saida = self._saida_prints(mock_print)
+        self.assertEqual(itens, [])
+        self.assertIn("resultados_recebidos=0", saida)
+        self.assertIn("candidatos_examinados=0", saida)
+
+    # --- Cenário 2: API retorna vídeos, todos eliminados por filtros -----
+    def test_cenario2_api_retorna_videos_mas_todos_sao_filtrados(self):
+        self.provider._rejeitados_nesta_execucao = {"20"}
+        videos = [
+            self._video(10, duration=2.0),  # < MEDIA_VIDEO_DURACAO_MINIMA
+            dict(
+                self._video(30),
+                video_files=[{"width": 320, "height": 180, "fps": 30, "link": "https://cdn/30.mp4"}],
+            ),  # nenhum arquivo com largura >= MIN_WIDTH
+            self._video(20),  # já descartado nesta execução
+        ]
+
+        with mock.patch.object(self.provider, "_buscar", return_value=videos), mock.patch(
+            "builtins.print"
+        ) as mock_print:
+            itens = self.provider._buscar_com_fallback_de_queries(["q1"], duracao_alvo=6.0, ids_evitar=set())
+
+        saida = self._saida_prints(mock_print)
+        self.assertEqual(itens, [])
+        self.assertIn("candidatos_examinados=3", saida)
+        self.assertIn("rejeitados_por_duracao=1", saida)
+        self.assertIn("rejeitados_por_ausencia_de_arquivo_utilizavel=1", saida)
+        self.assertIn("rejeitados_por_ja_descartado_nesta_execucao=1", saida)
+        self.assertIn("candidatos_validos=0", saida)
+
+    # --- Cenário 3: candidato válido e download funciona -------------------
+    def test_cenario3_api_retorna_candidato_valido_e_baixa(self):
+        with mock.patch.object(self.provider, "_buscar", return_value=[self._video(1)]), mock.patch.object(
+            self.provider, "_baixar_arquivo", return_value=True
+        ), mock.patch.object(self.provider, "_salvar_metadata"), mock.patch("builtins.print") as mock_print:
+            itens = self.provider._buscar_com_fallback_de_queries(["q1"], duracao_alvo=6.0, ids_evitar=set())
+
+        self.assertEqual(len(itens), 1)
+        self.assertIn("fonte=api", itens[0].categoria)
+        saida = self._saida_prints(mock_print)
+        self.assertIn("✅ Download OK", saida)
+        self.assertIn("baixados_agora=1", saida)
+
+    # --- Cenário 4: candidato válido, mas download falha --------------------
+    def test_cenario4_candidato_valido_mas_download_falha(self):
+        with mock.patch.object(self.provider, "_buscar", return_value=[self._video(1)]), mock.patch.object(
+            self.provider, "_baixar_arquivo", return_value=False
+        ), mock.patch("builtins.print") as mock_print:
+            itens = self.provider._buscar_com_fallback_de_queries(["q1"], duracao_alvo=6.0, ids_evitar=set())
+
+        self.assertEqual(itens, [])
+        saida = self._saida_prints(mock_print)
+        self.assertIn("❌ Download falhou", saida)
+        self.assertIn("falhas_download=1", saida)
+
+    # --- Cenário 5: cache já tem o vídeo -> não baixa de novo --------------
+    def test_cenario5_cache_contem_video_existente_nao_baixa_de_novo(self):
+        self.provider._metadata = {
+            "1": {"caminho": "/tmp/cache_teste_fase2_1_1/1.mp4", "baixado_em": time.time(), "query": "q1"}
+        }
+        with mock.patch.object(self.provider, "_cache_valido", return_value=True), mock.patch.object(
+            self.provider, "_buscar", return_value=[self._video(1)]
+        ), mock.patch.object(self.provider, "_baixar_arquivo") as mock_baixar, mock.patch.object(
+            self.provider, "_salvar_metadata"
+        ), mock.patch(
+            "builtins.print"
+        ) as mock_print:
+            itens = self.provider._buscar_com_fallback_de_queries(["q1"], duracao_alvo=6.0, ids_evitar=set())
+
+        mock_baixar.assert_not_called()
+        self.assertEqual(len(itens), 1)
+        self.assertIn("fonte=cache", itens[0].categoria)
+        saida = self._saida_prints(mock_print)
+        self.assertIn("Cache HIT — vídeo já baixado", saida)
+        self.assertIn("reutilizados_do_cache=1", saida)
+
+    # --- Cenário 6: HTTP 403 / Cloudflare 1010 ------------------------------
+    def test_cenario6_http_403_1010_diagnostico_especifico_continua(self):
+        erro = urllib.error.HTTPError(
+            url="https://api.pexels.com/videos/search",
+            code=403,
+            msg="erro",
+            hdrs=None,
+            fp=io.BytesIO(b"error code: 1010"),
+        )
+        with mock.patch("bot_main.urllib.request.urlopen", side_effect=erro), mock.patch(
+            "builtins.print"
+        ) as mock_print:
+            itens = self.provider._buscar_com_fallback_de_queries(["q1"], duracao_alvo=6.0, ids_evitar=set())
+
+        self.assertEqual(itens, [])
+        saida = self._saida_prints(mock_print)
+        self.assertIn("Cloudflare", saida)
+
+    # --- Cenário 7: HTTP 429 -------------------------------------------------
+    def test_cenario7_http_429_diagnostico_especifico_continua(self):
+        erro = urllib.error.HTTPError(
+            url="https://api.pexels.com/videos/search",
+            code=429,
+            msg="erro",
+            hdrs=None,
+            fp=io.BytesIO(b"{}"),
+        )
+        with mock.patch("bot_main.urllib.request.urlopen", side_effect=erro), mock.patch(
+            "builtins.print"
+        ) as mock_print:
+            itens = self.provider._buscar_com_fallback_de_queries(["q1"], duracao_alvo=6.0, ids_evitar=set())
+
+        self.assertEqual(itens, [])
+        saida = self._saida_prints(mock_print)
+        self.assertIn("limite de requisições excedido", saida)
+
+    # --- Sanidade: tabela de scores aparece quando há candidatos -----------
+    def test_tabela_de_scores_aparece_quando_ha_candidatos(self):
+        with mock.patch.object(
+            self.provider, "_buscar", return_value=[self._video(1), self._video(2)]
+        ), mock.patch.object(self.provider, "_baixar_arquivo", return_value=True), mock.patch.object(
+            self.provider, "_salvar_metadata"
+        ), mock.patch(
+            "builtins.print"
+        ) as mock_print:
+            self.provider._buscar_com_fallback_de_queries(["q1"], duracao_alvo=6.0, ids_evitar=set())
+
+        saida = self._saida_prints(mock_print)
+        self.assertIn("📊 Candidatos Pexels", saida)
+        self.assertIn("relevância=", saida)
+        self.assertIn("qualidade=", saida)
+
+    # --- Sanidade: componentes do score somam para o score final -----------
+    def test_componentes_do_score_somam_para_o_score_final(self):
+        video = self._video(1)
+        arquivo = video["video_files"][0]
+        score = bot_main._pontuar_candidato_broll(video, arquivo, 0, 4, 6.0, set())
+        c = bot_main._componentes_score_candidato_broll(video, arquivo, 0, 4, 6.0, set())
+        esperado = round(
+            (
+                bot_main.BROLL_PESO_RELEVANCIA * c["relevancia"]
+                + bot_main.BROLL_PESO_QUALIDADE * c["qualidade"]
+                + bot_main.BROLL_PESO_ORIENTACAO * c["orientacao"]
+                + bot_main.BROLL_PESO_DURACAO * c["duracao"]
+                + bot_main.BROLL_PESO_DIVERSIDADE * c["diversidade"]
+            )
+            * 100,
+            2,
+        )
+        self.assertEqual(score, esperado)
+
+    # --- Sanidade: a API key nunca aparece no log da cascata ----------------
+    def test_chave_nunca_aparece_no_log_da_cascata(self):
+        erro = urllib.error.HTTPError(
+            url="https://api.pexels.com/videos/search",
+            code=403,
+            msg="erro",
+            hdrs=None,
+            fp=io.BytesIO(b"chave-de-teste invalida"),
+        )
+        with mock.patch("bot_main.urllib.request.urlopen", side_effect=erro), mock.patch(
+            "builtins.print"
+        ) as mock_print:
+            self.provider._buscar_com_fallback_de_queries(["q1"], duracao_alvo=6.0, ids_evitar=set())
+
+        saida = self._saida_prints(mock_print)
+        self.assertNotIn("chave-de-teste", saida)
 
 
 if __name__ == "__main__":

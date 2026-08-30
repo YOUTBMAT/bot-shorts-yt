@@ -759,39 +759,22 @@ class LocalMediaProvider(MediaProvider):
             return False
 
 
-def _pontuar_candidato_broll(
+def _componentes_score_candidato_broll(
     video: dict,
     arquivo: dict,
     indice_query: int,
     total_queries: int,
     duracao_alvo: float,
     ja_usados: Optional[set] = None,
-) -> float:
-    """Pontua (0-100) um candidato de B-roll do Pexels para um trecho
-    específico (Fase 2). Combina 5 fatores com pesos fixos (soma 1.0,
-    ver `BROLL_PESO_*`):
-
-    - Relevância (50%): posição da query que encontrou o vídeo na cascata
-      gerada por `_gerar_queries_visuais()` — a 1ª query é sempre a mais
-      específica ao trecho (dicionário visual PT->EN), então um resultado
-      da 1ª query pontua mais que um da 4ª.
-    - Qualidade (20%): resolução do arquivo de vídeo escolhido
-      (`_escolher_arquivo()`), normalizada contra `PEXELS_RESOLUCAO_PREFERIDA`.
-    - Orientação (15%): proximidade do aspect ratio de ORIGEM do vídeo
-      com 9:16 — vídeos já verticais pontuam mais, mas um horizontal bom
-      ainda pontua razoavelmente (nunca é descartado só por isso; o
-      pipeline já sabe cortar/zoom para vertical).
-    - Duração (10%): favorece vídeos com folga confortável sobre a
-      duração do trecho (nem curtos demais — já filtrados antes por
-      `MEDIA_VIDEO_DURACAO_MINIMA` — nem desproporcionalmente longos).
-    - Diversidade (5%): penalidade leve (não eliminatória) se este vídeo
-      já foi usado em outro trecho do MESMO Short — dá preferência a
-      variedade sem nunca escolher um candidato irrelevante só para
-      evitar repetição (item 10 da Fase 2: "é melhor reutilizar um vídeo
-      bom do que usar um vídeo completamente irrelevante").
-
-    Pura e sem I/O — testável isoladamente com dicts feitos à mão.
-    """
+) -> Dict[str, float]:
+    """Calcula os 5 fatores (0.0-1.0 cada) usados por
+    `_pontuar_candidato_broll()`, sem combiná-los em score final. Extraído
+    como função própria (Fase 2.1.1, item 3 — diagnóstico) só para que o
+    log de diagnóstico possa mostrar a composição do score de cada
+    candidato (relevância/qualidade/orientação/duração/diversidade)
+    sem duplicar a lógica de cálculo — `_pontuar_candidato_broll()` chama
+    esta função e só faz a soma ponderada. Nenhuma mudança de
+    comportamento/matemática: mesmos fatores, mesmas fórmulas."""
     ja_usados = ja_usados or set()
 
     # --- relevância: 1.0 na 1ª query, decaindo linearmente até perto de 0 ---
@@ -831,12 +814,57 @@ def _pontuar_candidato_broll(
     video_id = str(video.get("id"))
     diversidade = 0.0 if video_id in ja_usados else 1.0
 
+    return {
+        "relevancia": relevancia,
+        "qualidade": qualidade,
+        "orientacao": orientacao,
+        "duracao": duracao_score,
+        "diversidade": diversidade,
+    }
+
+
+def _pontuar_candidato_broll(
+    video: dict,
+    arquivo: dict,
+    indice_query: int,
+    total_queries: int,
+    duracao_alvo: float,
+    ja_usados: Optional[set] = None,
+) -> float:
+    """Pontua (0-100) um candidato de B-roll do Pexels para um trecho
+    específico (Fase 2). Combina 5 fatores com pesos fixos (soma 1.0,
+    ver `BROLL_PESO_*`):
+
+    - Relevância (50%): posição da query que encontrou o vídeo na cascata
+      gerada por `_gerar_queries_visuais()` — a 1ª query é sempre a mais
+      específica ao trecho (dicionário visual PT->EN), então um resultado
+      da 1ª query pontua mais que um da 4ª.
+    - Qualidade (20%): resolução do arquivo de vídeo escolhido
+      (`_escolher_arquivo()`), normalizada contra `PEXELS_RESOLUCAO_PREFERIDA`.
+    - Orientação (15%): proximidade do aspect ratio de ORIGEM do vídeo
+      com 9:16 — vídeos já verticais pontuam mais, mas um horizontal bom
+      ainda pontua razoavelmente (nunca é descartado só por isso; o
+      pipeline já sabe cortar/zoom para vertical).
+    - Duração (10%): favorece vídeos com folga confortável sobre a
+      duração do trecho (nem curtos demais — já filtrados antes por
+      `MEDIA_VIDEO_DURACAO_MINIMA` — nem desproporcionalmente longos).
+    - Diversidade (5%): penalidade leve (não eliminatória) se este vídeo
+      já foi usado em outro trecho do MESMO Short — dá preferência a
+      variedade sem nunca escolher um candidato irrelevante só para
+      evitar repetição (item 10 da Fase 2: "é melhor reutilizar um vídeo
+      bom do que usar um vídeo completamente irrelevante").
+
+    Pura e sem I/O — testável isoladamente com dicts feitos à mão.
+    """
+    c = _componentes_score_candidato_broll(
+        video, arquivo, indice_query, total_queries, duracao_alvo, ja_usados
+    )
     score = (
-        BROLL_PESO_RELEVANCIA * relevancia
-        + BROLL_PESO_QUALIDADE * qualidade
-        + BROLL_PESO_ORIENTACAO * orientacao
-        + BROLL_PESO_DURACAO * duracao_score
-        + BROLL_PESO_DIVERSIDADE * diversidade
+        BROLL_PESO_RELEVANCIA * c["relevancia"]
+        + BROLL_PESO_QUALIDADE * c["qualidade"]
+        + BROLL_PESO_ORIENTACAO * c["orientacao"]
+        + BROLL_PESO_DURACAO * c["duracao"]
+        + BROLL_PESO_DIVERSIDADE * c["diversidade"]
     )
     return round(score * 100, 2)
 
@@ -1109,6 +1137,17 @@ class PexelsMediaProvider(MediaProvider):
 
         try:
             with urllib.request.urlopen(requisicao, timeout=PEXELS_TIMEOUT_SECONDS) as resposta:
+                # Defensivo: em produção `resposta` sempre tem `.status`
+                # (http.client.HTTPResponse), mas dublês de teste minimalistas
+                # (ver `test_pexels_broll.py`) podem não implementar nem
+                # `.status` nem `.getcode()` — nesse caso só não sabemos o
+                # código (assumimos 200, já que não houve HTTPError) em vez
+                # de quebrar a chamada.
+                status_code = getattr(resposta, "status", None)
+                if status_code is None and hasattr(resposta, "getcode"):
+                    status_code = resposta.getcode()
+                if status_code is None:
+                    status_code = 200
                 corpo_bruto = resposta.read().decode("utf-8")
         except urllib.error.HTTPError as err:
             corpo_erro = self._ler_corpo_erro(err)
@@ -1165,7 +1204,15 @@ class PexelsMediaProvider(MediaProvider):
                 f"❌ Pexels: resposta inesperada (não é um objeto JSON) na busca por '{query}'."
             )
 
-        return dados.get("videos", [])
+        videos = dados.get("videos", [])
+        # Diagnóstico (Fase 2.1.1, item 2/4): distingue "API respondeu 200
+        # mas devolveu 0 resultados" (Caso A do diagnóstico) de qualquer
+        # eliminação POSTERIOR feita pelo nosso próprio pipeline (filtros,
+        # download, cache — Casos B/C/D), que é logada mais adiante em
+        # `_buscar_com_fallback_de_queries()`. Sem esta linha, as duas
+        # situações eram indistinguíveis no log.
+        print(f"   📡 Pexels API: HTTP={status_code} resultados_recebidos={len(videos)}")
+        return videos
 
     def _escolher_arquivo(self, video: dict) -> Optional[dict]:
         """Entre os `video_files` de um resultado do Pexels, escolhe o que
@@ -1320,69 +1367,166 @@ class PexelsMediaProvider(MediaProvider):
         lista final volta ORDENADA por score decrescente — quem chama (o
         `MediaManager`) só precisa pegar o primeiro que passar na
         validação completa."""
-        candidatos_pontuados: List[Tuple[float, dict, dict, str, str]] = []
+        candidatos_pontuados: List[Tuple[float, dict, dict, str, str, int]] = []
         total_queries = max(1, len(queries))
 
         for indice_query, query in enumerate(queries):
             if len({c[3] for c in candidatos_pontuados}) >= BROLL_CANDIDATOS_POR_TRECHO_ALVO:
                 break  # já tem candidatos suficientes; não gasta mais buscas
 
+            # --- Diagnóstico (Fase 2.1.1, itens 2/6): distingue cache HIT
+            # (resultado desta query já obtido nesta execução, nenhuma
+            # requisição nova) de cache MISS (vai consultar a API agora).
+            # `_buscar()` já loga HTTP/resultados_recebidos no caso MISS.
+            print(f"🔎 Pexels query: \"{query}\"")
             resultados = self._cache_busca_execucao.get(query)
             if resultados is None:
+                print("   🌐 Cache MISS — consultando Pexels")
                 try:
                     resultados = self._buscar(query)
                 except RuntimeError as err:
                     print(f"⚠️ {err}")
                     resultados = []
                 self._cache_busca_execucao[query] = resultados
+            else:
+                print(f"   🗄️ Cache HIT — busca (reaproveitando {len(resultados)} resultado(s) já obtidos nesta execução)")
+
+            # --- Diagnóstico (itens 2/4): motivos de rejeição são
+            # contados usando EXATAMENTE os filtros que existem abaixo —
+            # nenhuma categoria nova foi inventada para o log. Hoje só
+            # existem 3 filtros nesta cascata: duração mínima, blacklist
+            # de descartados nesta execução, e ausência de um arquivo
+            # (`video_files`) com largura >= MIN_WIDTH. Não há, no código
+            # atual, filtro de orientação, de duplicidade ou de score
+            # mínimo nesta etapa — por isso não aparecem aqui.
+            rejeitados_duracao = 0
+            rejeitados_ja_descartado = 0
+            rejeitados_sem_arquivo_utilizavel = 0
+            validos_desta_query = 0
 
             for video in resultados:
                 duracao = video.get("duration", 0)
                 if duracao < MEDIA_VIDEO_DURACAO_MINIMA:
+                    rejeitados_duracao += 1
                     continue
                 video_id = str(video.get("id"))
                 if video_id in self._rejeitados_nesta_execucao:
+                    rejeitados_ja_descartado += 1
                     continue
                 arquivo = self._escolher_arquivo(video)
                 if arquivo is None:
+                    rejeitados_sem_arquivo_utilizavel += 1
                     continue
                 score = _pontuar_candidato_broll(
                     video, arquivo, indice_query, total_queries, duracao_alvo, ids_evitar
                 )
-                candidatos_pontuados.append((score, video, arquivo, video_id, query))
+                candidatos_pontuados.append((score, video, arquivo, video_id, query, indice_query))
+                validos_desta_query += 1
+
+            print(
+                "   🔍 Processamento: "
+                f"candidatos_examinados={len(resultados)} "
+                f"rejeitados_por_duracao={rejeitados_duracao} "
+                f"rejeitados_por_ja_descartado_nesta_execucao={rejeitados_ja_descartado} "
+                f"rejeitados_por_ausencia_de_arquivo_utilizavel={rejeitados_sem_arquivo_utilizavel} "
+                f"-> candidatos_validos={validos_desta_query}"
+            )
 
         candidatos_pontuados.sort(key=lambda item: item[0], reverse=True)
 
+        # --- Diagnóstico (item 3): tabela de scores, mostrada sempre que
+        # houver ao menos um candidato pontuado — ANTES da escolha final
+        # (download/cache), para explicar por que cada um ganhou/perdeu.
+        if candidatos_pontuados:
+            print("📊 Candidatos Pexels (ordenados por score, melhor primeiro):")
+            limite_exibicao = 20
+            for posicao, (score, video, arquivo, video_id, query_origem, indice_q) in enumerate(
+                candidatos_pontuados[:limite_exibicao], start=1
+            ):
+                c = _componentes_score_candidato_broll(
+                    video, arquivo, indice_q, total_queries, duracao_alvo, ids_evitar
+                )
+                print(
+                    f"   {posicao}. video_id={video_id} score={score:.1f} (query=\"{query_origem}\")"
+                )
+                print(
+                    f"      relevância={c['relevancia']:.2f} qualidade={c['qualidade']:.2f} "
+                    f"orientação={c['orientacao']:.2f} duração={c['duracao']:.2f} "
+                    f"diversidade={c['diversidade']:.2f}"
+                )
+            if len(candidatos_pontuados) > limite_exibicao:
+                print(f"   … e mais {len(candidatos_pontuados) - limite_exibicao} candidato(s) não exibido(s).")
+
+        # --- Diagnóstico (itens 4/5/6/7): a partir daqui, candidatos
+        # válidos podem ainda não virar `itens` por 3 motivos REAIS: já
+        # apareceram via outra query (duplicado), o teto de downloads da
+        # execução foi atingido, ou o download falhou. Cada um é contado
+        # e logado separadamente, e cada item final indica sua fonte
+        # (`fonte=cache` ou `fonte=api`) — sem isso, um caminho como
+        # `cache/pexels/31541421.mp4` no log não permite saber se acabou
+        # de ser baixado ou só reaproveitado.
         itens: List[MediaItem] = []
         vistos: set = set()
-        for score, video, arquivo, video_id, query_origem in candidatos_pontuados:
+        duplicados_entre_queries = 0
+        reutilizados_do_cache = 0
+        baixados_agora = 0
+        falhas_download = 0
+        bloqueados_por_teto_download = 0
+
+        for score, video, arquivo, video_id, query_origem, _indice_q in candidatos_pontuados:
             if video_id in vistos:
+                duplicados_entre_queries += 1
                 continue  # o mesmo vídeo pode ter sido encontrado por mais de uma query da cascata
             vistos.add(video_id)
 
             if video_id in self._metadata and self._cache_valido(self._metadata[video_id]):
+                reutilizados_do_cache += 1
+                print(f"🗄️ Cache HIT — vídeo já baixado (video_id={video_id}, fonte=cache)")
                 itens.append(
-                    MediaItem(caminho=self._metadata[video_id]["caminho"], categoria=f"pexels/score={score:.1f}", tipo="video")
+                    MediaItem(
+                        caminho=self._metadata[video_id]["caminho"],
+                        categoria=f"pexels/score={score:.1f}/fonte=cache",
+                        tipo="video",
+                    )
                 )
                 continue
 
             if self._downloads_nesta_execucao >= PEXELS_MAX_DOWNLOADS:
+                bloqueados_por_teto_download += 1
                 continue  # teto de downloads da execução (item 19) — mesmo com candidatos bons sobrando
 
+            print(f"⬇️ Download novo (video_id={video_id}, fonte=api, url={arquivo.get('link', '?')})")
             destino = os.path.join(self.cache_dir, f"{video_id}.mp4")
             if not self._baixar_arquivo(arquivo["link"], destino):
+                falhas_download += 1
+                print(f"❌ Download falhou (video_id={video_id})")
                 continue
+            print(f"✅ Download OK (video_id={video_id})")
             self._downloads_nesta_execucao += 1
+            baixados_agora += 1
 
             self._metadata[video_id] = {
                 "caminho": destino,
                 "baixado_em": time.time(),
                 "query": query_origem,
             }
-            itens.append(MediaItem(caminho=destino, categoria=f"pexels/score={score:.1f}", tipo="video"))
+            itens.append(
+                MediaItem(caminho=destino, categoria=f"pexels/score={score:.1f}/fonte=api", tipo="video")
+            )
 
         if itens:
             self._salvar_metadata()
+
+        print(
+            "📦 Resultado final do trecho: "
+            f"candidatos_pontuados={len(candidatos_pontuados)} "
+            f"duplicados_entre_queries={duplicados_entre_queries} "
+            f"reutilizados_do_cache={reutilizados_do_cache} "
+            f"baixados_agora={baixados_agora} "
+            f"falhas_download={falhas_download} "
+            f"bloqueados_por_teto_download={bloqueados_por_teto_download} "
+            f"-> itens_finais={len(itens)}"
+        )
 
         return itens
 
