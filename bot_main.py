@@ -421,9 +421,12 @@ TERMOS_VISUAIS_PT_EN: Dict[str, List[str]] = {
     "oceano": ["ocean underwater", "deep ocean", "ocean waves aerial"],
     "mar": ["sea waves", "ocean sea aerial"],
     "baleia": ["blue whale", "whale underwater", "ocean whale", "marine life"],
+    "cachalote": ["sperm whale underwater", "sperm whale", "whale echolocation", "sperm whale ocean"],
+    "orca": ["orca whale underwater", "killer whale ocean"],
     "tubarao": ["shark underwater", "shark ocean"],
     "golfinho": ["dolphin underwater", "dolphin ocean"],
     "polvo": ["octopus underwater", "octopus ocean"],
+    "peixe": ["fish underwater", "fish swimming ocean"],
     "recife": ["coral reef underwater", "coral reef ocean"],
     # Natureza / geografia
     "floresta": ["forest aerial", "forest trees", "rainforest"],
@@ -461,6 +464,86 @@ TERMOS_VISUAIS_PT_EN: Dict[str, List[str]] = {
     "computador": ["computer technology", "computer chip"],
     "internet": ["internet network technology", "data network"],
 }
+
+# Conceitos CONTEXTUAIS (Fase 2.1): diferente de TERMOS_VISUAIS_PT_EN (uma
+# entidade nomeada específica), aqui a chave é uma palavra-gatilho —
+# substantivo genérico, adjetivo/qualificador ou verbo de ação — que por
+# si só já indica um CONCEITO visual, mesmo sem nenhuma entidade nomeada
+# por perto no trecho. É o que resolve o caso relatado na Fase 2.1: o
+# trecho "uma criatura real, que navega pelas profundezas" não menciona
+# nenhum animal específico (nada bate em TERMOS_VISUAIS_PT_EN), mas
+# "criatura"/"navega"/"profundezas" já bastam para produzir queries
+# compostas e visuais como "deep sea creature" — em vez de cair nas
+# palavras soltas em português que sobrariam do roteiro ("estamos",
+# "falando", "monstro"). Usada como 2ª camada em `_gerar_queries_visuais`,
+# só depois das entidades diretas — ver comentário lá para a ordem de
+# prioridade completa. Mesma lógica de "português -> conceito em inglês
+# composto", só que no nível do CONCEITO em vez da ENTIDADE.
+CONCEITOS_CONTEXTUAIS_PT_EN: Dict[str, List[str]] = {
+    # Criatura/monstro sem nome específico (contexto: mar/profundezas)
+    "criatura": ["deep sea creature", "ocean creature underwater", "sea creature swimming"],
+    "monstro": ["deep sea creature", "sea monster silhouette underwater"],
+    "predador": ["ocean predator", "marine predator underwater"],
+    # Profundidade / ambiente
+    "profundezas": ["deep ocean", "deep sea underwater"],
+    "profundo": ["deep ocean", "deep underwater"],
+    "profunda": ["deep ocean", "deep underwater"],
+    "abismo": ["deep sea abyss", "ocean trench underwater"],
+    # Perigo / letalidade
+    "perigoso": ["dangerous marine animal", "dangerous ocean animal"],
+    "perigosa": ["dangerous marine animal", "dangerous ocean animal"],
+    "perigosos": ["dangerous marine animal", "dangerous ocean animal"],
+    "mortal": ["deadly ocean creature", "dangerous marine animal"],
+    "mortais": ["deadly ocean creature", "dangerous marine animal"],
+    "veneno": ["venomous animal", "poisonous creature"],
+    "venenoso": ["venomous animal underwater", "poisonous creature"],
+    "venenosa": ["venomous animal underwater", "poisonous creature"],
+    # Ações visuais (item 7 da Fase 2.1)
+    "nada": ["marine animal swimming", "ocean creature swimming underwater"],
+    "nadar": ["marine animal swimming", "ocean creature swimming underwater"],
+    "nadando": ["marine animal swimming", "ocean creature swimming underwater"],
+    "navega": ["ocean creature swimming", "underwater creature moving"],
+    "navegando": ["ocean creature swimming", "underwater creature moving"],
+    "atacando": ["predator attack ocean", "shark attack underwater"],
+    "ataque": ["predator attack ocean", "shark attack underwater"],
+    "atacar": ["predator attack ocean", "shark attack underwater"],
+    "correndo": ["person running", "running motion"],
+    "correr": ["person running", "running motion"],
+    "voando": ["bird flying sky", "flying animal wings"],
+    "voar": ["bird flying sky", "flying animal wings"],
+    "decolando": ["rocket launch", "rocket liftoff"],
+    "decolagem": ["rocket launch", "rocket liftoff"],
+    "explodindo": ["explosion slow motion", "explosion close up"],
+    "explosao": ["explosion slow motion", "explosion close up"],
+    # Qualificadores gerais (item 4/13)
+    "gigante": ["giant animal", "massive creature"],
+    "gigantesco": ["giant animal", "massive creature"],
+    "minusculo": ["microscopic close up", "tiny creature macro"],
+    "misterioso": ["mysterious underwater scene", "mysterious dark ocean"],
+    "misteriosa": ["mysterious underwater scene", "mysterious dark ocean"],
+    "escuro": ["dark ocean underwater", "deep dark sea"],
+    "escura": ["dark ocean underwater", "deep dark sea"],
+    "antigo": ["ancient ruins", "ancient artifact"],
+    "antiga": ["ancient ruins", "ancient artifact"],
+    "esconde": ["hidden underwater mystery", "deep ocean mystery"],
+    "escondido": ["hidden underwater mystery", "deep ocean mystery"],
+    "arma": ["dangerous marine animal", "ocean predator"],
+    "armas": ["dangerous marine animal", "ocean predator"],
+}
+
+# Fallback genérico (Fase 2.1): usado APENAS quando nenhuma palavra do
+# trecho bate em `TERMOS_VISUAIS_PT_EN` nem em
+# `CONCEITOS_CONTEXTUAIS_PT_EN` — ou seja, quando não há absolutamente
+# nada de visual reconhecível no texto (ex.: trecho só com conectivos).
+# Sempre queries compostas e em inglês — NUNCA mais uma palavra solta em
+# português como acontecia antes desta fase (a causa raiz do bug
+# relatado: "estamos", "corpo", "morte" chegando ao Pexels como query).
+PEXELS_QUERIES_FALLBACK_GENERICAS: List[str] = [
+    "nature landscape",
+    "abstract background loop",
+    "cinematic slow motion",
+    "city time lapse",
+]
 
 
 
@@ -862,36 +945,48 @@ class PexelsMediaProvider(MediaProvider):
                 )
         return validos
 
-    # --- queries visuais (Fase 3) -----------------------------------------
-    def _gerar_queries_visuais(self, roteiro: str) -> List[str]:
-        """Gera até MAX_PALAVRAS_CHAVE_PESQUISA queries de busca VISUAIS a
-        partir do roteiro — não apenas as palavras mais frequentes.
+    # --- queries visuais (Fase 2, refinado na Fase 2.1) --------------------
+    def _gerar_queries_visuais(self, texto: str) -> List[str]:
+        """Gera até `MAX_PALAVRAS_CHAVE_PESQUISA` queries de busca VISUAIS,
+        SEMÂNTICAS e compostas a partir de `texto` (o roteiro inteiro, na
+        chamada de `listar_videos()`, ou o texto de UM trecho, na chamada
+        de `listar_videos_contextual()` — funciona igual para os dois).
 
-        Diferença para a extração antiga (por frequência simples): aqui,
-        cada palavra do roteiro que bate com `TERMOS_VISUAIS_PT_EN` vira
-        uma ou mais queries em INGLÊS já testadas para descrever bem a
-        entidade visualmente (ex.: "saturno" -> "saturn rings", não
-        "saturno" sozinho) — inglês retorna consistentemente mais e
-        melhores resultados no Pexels que termos avulsos em português.
-        Números, unidades, comparativos e outras palavras sem valor visual
-        (`PEXELS_PALAVRAS_ABSTRATAS`) são sempre ignorados, mesmo que sejam
-        frequentes no roteiro (é exatamente o caso de "anos"/"milhoes" no
-        exemplo que motivou esta fase).
+        Fase 2.1 (auditoria de qualidade das queries): a versão anterior
+        caía, na ausência de uma entidade conhecida, para as próprias
+        palavras em português que sobrassem dos filtros — o que produzia
+        queries inúteis para trechos sem substantivo concreto reconhecido
+        (ex.: "estamos", "falando", "corpo", "morte" viravam queries
+        literais, e o Pexels não achava nada). Esta versão nunca mais
+        expõe uma palavra solta em português como query: passa a usar
+        DUAS camadas de dicionário — a antiga (`TERMOS_VISUAIS_PT_EN`,
+        entidades nomeadas: "cachalote", "saturno"...) e uma nova
+        (`CONCEITOS_CONTEXTUAIS_PT_EN`, palavras-gatilho de CONTEXTO —
+        substantivo genérico, qualificador ou ação — que já bastam para um
+        conceito visual mesmo sem entidade nomeada por perto: "criatura",
+        "profundezas", "nadando", "perigoso"...). Se nada do texto bater em
+        nenhum dos dois, cai para um pequeno conjunto de queries genéricas
+        JÁ COMPOSTAS em inglês (`PEXELS_QUERIES_FALLBACK_GENERICAS`) — nunca
+        mais para uma palavra crua.
 
-        Palavras SEM entrada no dicionário mas que sobrevivem aos filtros
-        (não são stopword/abstrata/curta) ainda entram como fallback — em
-        português mesmo, mantendo pelo menos alguma chance de retorno —
-        mas só depois de esgotadas as correspondências do dicionário, e
-        nunca sozinhas se puderem ser evitadas (ver `MAX_PALAVRAS_CHAVE_PESQUISA`
-        cortando o total).
+        Heurística determinística por dicionário (sem IA/embeddings/NLP
+        pesado, de propósito — ver item 18 da Fase 2.1): olha o TEXTO
+        INTEIRO do trecho (não só as primeiras palavras), então um conceito
+        que só aparece no meio ou no fim ("...que navega pelas
+        profundezas") ainda é encontrado.
 
-        Deliberadamente uma heurística por dicionário/frequência, sem
-        IA/embeddings — fora de escopo desta fase e desnecessário para o
-        resultado pedido.
+        Prioridade (mais específico primeiro, cascata preservada): 1)
+        entidades nomeadas; 2) conceitos/contexto; 3) fallback genérico —
+        só quando as duas primeiras camadas não renderam NADA. Diferença
+        importante em relação à versão anterior: se as camadas 1+2 juntas
+        renderem menos que `MAX_PALAVRAS_CHAVE_PESQUISA` queries, a função
+        devolve só o que encontrou (queries melhores, não mais queries —
+        ver item 10 da Fase 2.1), em vez de completar o restante com
+        palavras soltas de qualidade duvidosa.
         """
         contagem: Dict[str, int] = {}
         ordem_primeira_ocorrencia: List[str] = []
-        for palavra in re.findall(r"[A-Za-zÀ-ÿ]+", roteiro):
+        for palavra in re.findall(r"[A-Za-zÀ-ÿ]+", texto):
             normalizada = _normalizar_palavra(palavra)
             if (
                 len(normalizada) < PEXELS_MIN_PALAVRA_LEN
@@ -904,9 +999,10 @@ class PexelsMediaProvider(MediaProvider):
             contagem[normalizada] = contagem.get(normalizada, 0) + 1
 
         # Ordena por frequência (desc) e, em empate, pela ordem de
-        # primeira aparição no roteiro — mais estável e previsível que
-        # ordem alfabética pura para um texto curto de Short.
-        palavras_ordenadas = sorted(
+        # primeira aparição no texto — só usado para desempatar QUAL
+        # entidade/conceito entra primeiro quando o trecho tem mais
+        # candidatos do que cabe em MAX_PALAVRAS_CHAVE_PESQUISA.
+        palavras_por_prioridade = sorted(
             contagem.keys(),
             key=lambda p: (-contagem[p], ordem_primeira_ocorrencia.index(p)),
         )
@@ -914,30 +1010,35 @@ class PexelsMediaProvider(MediaProvider):
         queries: List[str] = []
         vistas: set = set()
 
-        def _adicionar(query: str) -> None:
-            if query not in vistas and len(queries) < MAX_PALAVRAS_CHAVE_PESQUISA:
-                vistas.add(query)
-                queries.append(query)
+        def _adicionar_todas(candidatas: List[str]) -> None:
+            for query in candidatas:
+                if query not in vistas and len(queries) < MAX_PALAVRAS_CHAVE_PESQUISA:
+                    vistas.add(query)
+                    queries.append(query)
 
-        # 1ª passada: prioriza palavras com correspondência no dicionário
-        # visual (substantivos/entidades concretas conhecidas).
-        for palavra in palavras_ordenadas:
-            if len(queries) >= MAX_PALAVRAS_CHAVE_PESQUISA:
-                break
-            for query_visual in TERMOS_VISUAIS_PT_EN.get(palavra, []):
-                _adicionar(query_visual)
-
-        # 2ª passada: só se ainda houver espaço, completa com as palavras
-        # em português que sobreviveram aos filtros mas não têm entrada no
-        # dicionário — melhor que nada, mesmo não sendo inglês.
-        for palavra in palavras_ordenadas:
+        # 1ª camada — entidades nomeadas conhecidas (a mais específica: um
+        # animal/objeto/planeta identificado explicitamente no texto).
+        for palavra in palavras_por_prioridade:
             if len(queries) >= MAX_PALAVRAS_CHAVE_PESQUISA:
                 break
             if palavra in TERMOS_VISUAIS_PT_EN:
-                continue  # já contribuiu na 1ª passada
-            _adicionar(palavra)
+                _adicionar_todas(TERMOS_VISUAIS_PT_EN[palavra])
 
-        return queries or ["nature landscape"]  # fallback genérico se o roteiro não render nenhum termo válido
+        # 2ª camada (Fase 2.1) — conceito/contexto: sem entidade nomeada
+        # específica, mas com uma palavra-gatilho (substantivo genérico,
+        # qualificador ou ação) que já descreve um conceito visual.
+        for palavra in palavras_por_prioridade:
+            if len(queries) >= MAX_PALAVRAS_CHAVE_PESQUISA:
+                break
+            if palavra in CONCEITOS_CONTEXTUAIS_PT_EN:
+                _adicionar_todas(CONCEITOS_CONTEXTUAIS_PT_EN[palavra])
+
+        # 3ª camada — nada no texto bateu em nenhum dos dois dicionários:
+        # fallback genérico já composto em inglês, nunca uma palavra crua.
+        if not queries:
+            _adicionar_todas(PEXELS_QUERIES_FALLBACK_GENERICAS)
+
+        return queries
 
     # --- busca / download ---------------------------------------------------
     def _ler_corpo_erro(self, err: "urllib.error.HTTPError") -> str:
@@ -1193,7 +1294,7 @@ class PexelsMediaProvider(MediaProvider):
         if not texto:
             return []
         queries = self._gerar_queries_visuais(texto)[:BROLL_MAX_QUERIES_POR_TRECHO]
-        print("🔎 Queries:")
+        print("🎯 Queries semânticas:")
         for indice, query in enumerate(queries, start=1):
             print(f"   {indice}. {query}")
         itens = self._buscar_com_fallback_de_queries(queries, duracao_alvo, ids_evitar or set())
