@@ -1271,7 +1271,16 @@ class PexelsMediaProvider(MediaProvider):
         `PEXELS_MIN_DOWNLOADS_DESEJADOS`. `contexto` é o roteiro — sem ele
         não há como gerar queries visuais, então devolve só o que já está
         em cache (podendo ser uma lista vazia, o que faz o MediaManager
-        cair para o fallback local)."""
+        cair para o fallback local).
+
+        Orçamento (Fase 2.1.1 → correção B): o número de vídeos NOVOS
+        baixados por esta chamada é limitado pelo orçamento RESIDUAL da
+        execução inteira (`PEXELS_MAX_DOWNLOADS - self._downloads_nesta_execucao`),
+        não mais por `PEXELS_MAX_DOWNLOADS` sozinho — este método pode ser
+        chamado depois que o B-roll contextual por trecho já gastou parte
+        (ou todo) o orçamento, e não deve gastar mais do que sobrou. Itens
+        já em cache (`em_cache`) continuam de graça — não consomem
+        orçamento nenhum, contam à parte."""
         em_cache = self._videos_em_cache_validos()
         if len(em_cache) >= PEXELS_MIN_DOWNLOADS_DESEJADOS:
             return em_cache
@@ -1279,11 +1288,18 @@ class PexelsMediaProvider(MediaProvider):
         if not contexto:
             return em_cache
 
+        orcamento_restante = max(0, PEXELS_MAX_DOWNLOADS - self._downloads_nesta_execucao)
+        if orcamento_restante <= 0:
+            # Nada de orçamento sobrando — nem vale a pena consultar a API
+            # (gastaria requisições à toa para candidatos que não
+            # poderiam ser baixados de qualquer forma).
+            return em_cache
+
         queries = self._gerar_queries_visuais(contexto)
         novos: List[MediaItem] = []
 
         for query in queries:
-            if len(em_cache) + len(novos) >= PEXELS_MAX_DOWNLOADS:
+            if len(novos) >= orcamento_restante:
                 break
             resultados = self._cache_busca_execucao.get(query)
             if resultados is None:
@@ -1295,7 +1311,7 @@ class PexelsMediaProvider(MediaProvider):
                 self._cache_busca_execucao[query] = resultados
 
             for video in resultados:
-                if len(em_cache) + len(novos) >= PEXELS_MAX_DOWNLOADS:
+                if len(novos) >= orcamento_restante:
                     break
 
                 duracao = video.get("duration", 0)
@@ -3688,8 +3704,23 @@ def _montar_fundo_multiplo(
     `escolher_fundo_e_criar_video()` para só confirmar no histórico
     (`MediaManager.confirmar_uso()`) os vídeos que de fato entraram no
     Short publicado."""
-    if not caminhos_disponiveis:
+    # (Fase 2.1.1 → correção B/C) `caminhos_disponiveis` deixou de ser uma
+    # pré-condição obrigatória aqui: desde que `escolher_fundo_e_criar_video()`
+    # não busca mais o pool de reserva antecipadamente (para não gastar o
+    # orçamento global de downloads do Pexels ANTES do B-roll contextual por
+    # trecho rodar), este parâmetro pode chegar vazio de propósito. Só é
+    # erro fatal de fato se, quando o pool for REALMENTE necessário (algum
+    # trecho sem candidato contextual), não houver como buscá-lo (sem
+    # `media_manager`) nem nada já disponível — ver a busca lazy dentro do
+    # loop abaixo. Quando `media_manager` é None (uso direto em teste/
+    # chamada isolada, sem contextual nem forma de buscar sob demanda),
+    # mantém a checagem antecipada de antes: nesse caso o chamador PRECISA
+    # ter passado o pool pronto.
+    if not caminhos_disponiveis and media_manager is None:
         raise FundoInvalidoError("❌ Nenhum vídeo de fundo disponível para montar os B-rolls.")
+
+    pool_de_reserva: List[str] = list(caminhos_disponiveis)
+    pool_ja_buscado = bool(caminhos_disponiveis)
 
     clips_segmento: List[VideoClip] = []
     caminhos_usados: List[str] = []
@@ -3734,10 +3765,31 @@ def _montar_fundo_multiplo(
             if fila_candidatos:
                 caminho = fila_candidatos.pop(0)
             else:
-                caminho = caminhos_disponiveis[indice_pool % len(caminhos_disponiveis)]
+                if not pool_de_reserva:
+                    # Só busca o pool de reserva agora, sob demanda — e só
+                    # uma vez por chamada de `_montar_fundo_multiplo()`
+                    # (`pool_ja_buscado`), mesmo que vários trechos caiam
+                    # aqui: se a primeira busca já veio vazia, tentar de
+                    # novo não mudaria nada (mesmo `media_manager`, mesmo
+                    # roteiro) e só gastaria chamadas à toa.
+                    if not pool_ja_buscado and media_manager is not None:
+                        pool_ja_buscado = True
+                        print(
+                            "↩️ Pool de reserva vazio — buscando fallback agora "
+                            "(media_manager.escolher_videos(), sob demanda)."
+                        )
+                        pool_de_reserva = media_manager.escolher_videos(
+                            contexto=roteiro_completo, quantidade=BROLL_MAX_SEGMENTOS
+                        )
+                    if not pool_de_reserva:
+                        raise FundoInvalidoError(
+                            "❌ Nenhum vídeo de fundo disponível para montar os B-rolls "
+                            f"(trecho {indice_segmento + 1}/{len(segmentos)})."
+                        )
+                caminho = pool_de_reserva[indice_pool % len(pool_de_reserva)]
                 indice_pool += 1
-                if caminho == ultimo_caminho_ok and len(caminhos_disponiveis) > 1:
-                    caminho = caminhos_disponiveis[indice_pool % len(caminhos_disponiveis)]
+                if caminho == ultimo_caminho_ok and len(pool_de_reserva) > 1:
+                    caminho = pool_de_reserva[indice_pool % len(pool_de_reserva)]
                     indice_pool += 1
 
             try:
@@ -4019,22 +4071,20 @@ def criar_video(
 def escolher_fundo_e_criar_video(roteiro: str, caminho_audio: str, media_manager: MediaManager) -> str:
     """Ponte entre a biblioteca de mídia e `criar_video()`.
 
-    Desde a Fase 4, pede um POOL de candidatos (não mais um único vídeo):
-    `media_manager.escolher_videos(contexto=roteiro, quantidade=BROLL_MAX_SEGMENTOS)`
-    — o roteiro é passado como contexto para que um provider remoto
-    (Pexels) possa gerar queries visuais de busca a partir dele; providers
-    locais o ignoram.
-
-    Desde a Fase 2, este pool NÃO é mais a fonte primária de B-roll: serve
-    como RESERVA dentro de `criar_video()`/`_montar_fundo_multiplo()`, que
-    agora busca um candidato contextual (relevante ao texto de CADA
-    trecho) primeiro, e só cai para este pool se a busca contextual não
-    achar nada para aquele trecho específico — mantendo o pipeline
-    resiliente mesmo se o texto do trecho vier vazio ou a busca contextual
-    falhar por completo (item 21 da Fase 2). A quantidade exata de trechos
-    de B-roll só é conhecida depois da transcrição (dentro de
-    `criar_video()`), então pede-se aqui um teto generoso; sobra não é
-    desperdício, só não é necessária.
+    Desde a correção B/C da Fase 2.1.1, NÃO busca mais antecipadamente o
+    pool de reserva (`media_manager.escolher_videos(...)`) — essa busca
+    consumia o orçamento GLOBAL de downloads do Pexels
+    (`PEXELS_MAX_DOWNLOADS`) inteiro antes mesmo do B-roll contextual por
+    trecho (Fase 2/2.1.1, a arquitetura REAL de seleção) rodar, deixando
+    todo trecho contextual bloqueado pelo teto (`bloqueados_por_teto_download`)
+    mesmo quando havia orçamento de sobra. Agora `criar_video()` recebe uma
+    lista de reserva vazia, e é `_montar_fundo_multiplo()` quem busca esse
+    pool sob demanda (lazy) — só quando algum trecho específico não tem
+    candidato contextual e realmente precisa do fallback. `listar_videos()`
+    (chamada dentro dessa busca lazy) agora respeita o orçamento RESIDUAL
+    (`PEXELS_MAX_DOWNLOADS - self._downloads_nesta_execucao`), então o
+    contextual — que roda primeiro, trecho a trecho — sempre tem prioridade
+    sobre a reserva.
 
     O histórico só é atualizado (`media_manager.confirmar_uso()`) DEPOIS
     que `criar_video()` retorna com sucesso, e SÓ para os vídeos que
@@ -4044,16 +4094,17 @@ def escolher_fundo_e_criar_video(roteiro: str, caminho_audio: str, media_manager
     verdade (`FundoInvalidoError` — o que já é raro, já que
     `_montar_fundo_multiplo()` tenta várias alternativas — contextual e de
     reserva — e reaproveita o último B-roll que funcionou por trecho),
-    descarta todos os candidatos desta tentativa e pede um novo pool, até
+    descarta os candidatos desta tentativa e tenta de novo, até
     `MEDIA_MAX_TENTATIVAS` — nunca derruba o workflow por causa de vídeos
     ruins.
     """
     ultimo_erro: Optional[Exception] = None
 
     for tentativa in range(1, MEDIA_MAX_TENTATIVAS + 1):
-        caminhos_fundo = media_manager.escolher_videos(
-            contexto=roteiro, quantidade=BROLL_MAX_SEGMENTOS
-        )
+        # Lista vazia de propósito: o pool de reserva agora é responsabilidade
+        # de `_montar_fundo_multiplo()`, buscado sob demanda (ver docstring
+        # acima e a Fase 2.1.1/correção C). Nada é pré-buscado aqui.
+        caminhos_fundo: List[str] = []
         try:
             caminho_saida, caminhos_usados = criar_video(
                 roteiro, caminho_audio, caminhos_fundo, media_manager=media_manager
@@ -4063,9 +4114,8 @@ def escolher_fundo_e_criar_video(roteiro: str, caminho_audio: str, media_manager
             for caminho in caminhos_fundo:
                 media_manager.descartar(caminho)
             print(
-                f"⚠️ Nenhum dos {len(caminhos_fundo)} fundo(s) candidato(s) funcionou "
-                f"durante a renderização ({err}); descartados desta execução. "
-                f"Tentativa {tentativa}/{MEDIA_MAX_TENTATIVAS}."
+                f"⚠️ Nenhum fundo candidato funcionou durante a renderização ({err}); "
+                f"descartados desta execução. Tentativa {tentativa}/{MEDIA_MAX_TENTATIVAS}."
             )
         else:
             # Só agora, com o vídeo final de verdade pronto, cada mídia

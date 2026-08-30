@@ -1657,5 +1657,169 @@ class TestDiagnosticoFase2_1_1(unittest.TestCase):
         self.assertNotIn("chave-de-teste", saida)
 
 
+# ===========================================================================
+# 24. Correção B/C (Fase 2.1.1) — orçamento residual em listar_videos() e
+#     pool de reserva lazy em _montar_fundo_multiplo()/escolher_fundo_e_criar_video().
+#
+#     Objetivo: o B-roll contextual por trecho (_buscar_com_fallback_de_queries,
+#     já coberto acima) deve ter prioridade sobre a pré-busca genérica de
+#     `escolher_videos()`/`listar_videos()` no consumo do teto GLOBAL
+#     `PEXELS_MAX_DOWNLOADS`. Nenhuma mudança em scoring, queries, cache ou
+#     filtros — só em QUANDO a pré-busca roda e QUANTO ela pode gastar.
+# ===========================================================================
+class TestListarVideosOrcamentoResidual(unittest.TestCase):
+    def setUp(self):
+        self.provider = bot_main.PexelsMediaProvider.__new__(bot_main.PexelsMediaProvider)
+        self.provider.api_key = "chave-de-teste"
+        self.provider.cache_dir = "/tmp/cache_teste_orcamento_residual"
+        self.provider.metadata_path = "/tmp/cache_teste_orcamento_residual/metadata.json"
+        self.provider._metadata = {}
+        self.provider._rejeitados_nesta_execucao = set()
+        self.provider._cache_busca_execucao = {}
+        self.provider._downloads_nesta_execucao = 0
+
+    def _video(self, video_id, duration=12, width=1920, height=1080):
+        return {
+            "id": video_id,
+            "duration": duration,
+            "width": width,
+            "height": height,
+            "video_files": [
+                {"width": width, "height": height, "fps": 30, "link": f"https://cdn/{video_id}.mp4"}
+            ],
+        }
+
+    def test_baixa_ate_o_orcamento_residual_mesmo_com_mais_candidatos_disponiveis(self):
+        # PEXELS_MAX_DOWNLOADS=6, mas 4 já foram gastos alhures (pelo
+        # contextual, por exemplo) nesta mesma execução -> só sobram 2.
+        self.provider._downloads_nesta_execucao = 4
+        videos = [self._video(i) for i in range(1, 6)]  # 5 candidatos válidos disponíveis
+
+        with mock.patch.object(self.provider, "_buscar", return_value=videos), mock.patch.object(
+            self.provider, "_baixar_arquivo", return_value=True
+        ), mock.patch.object(self.provider, "_salvar_metadata"), mock.patch("builtins.print"):
+            resultado = self.provider.listar_videos(contexto="roteiro qualquer")
+
+        self.assertEqual(len(resultado), 2)  # não 5, respeitou o orçamento residual (6-4=2)
+        self.assertEqual(self.provider._downloads_nesta_execucao, 6)  # nunca ultrapassa PEXELS_MAX_DOWNLOADS
+
+    def test_orcamento_zerado_nao_consulta_a_api(self):
+        self.provider._downloads_nesta_execucao = 6  # já no teto global
+
+        with mock.patch.object(self.provider, "_buscar") as mock_buscar, mock.patch("builtins.print"):
+            resultado = self.provider.listar_videos(contexto="roteiro qualquer")
+
+        mock_buscar.assert_not_called()  # nem tenta: não há orçamento pra baixar nada mesmo
+        self.assertEqual(resultado, [])
+        self.assertEqual(self.provider._downloads_nesta_execucao, 6)  # não regride nem ultrapassa
+
+    def test_cache_ja_suficiente_nao_consulta_a_api_nem_gasta_orcamento(self):
+        itens_em_cache = [_media_item(f"cache{i}.mp4") for i in range(bot_main.PEXELS_MIN_DOWNLOADS_DESEJADOS)]
+        with mock.patch.object(
+            self.provider, "_videos_em_cache_validos", return_value=itens_em_cache
+        ), mock.patch.object(self.provider, "_buscar") as mock_buscar, mock.patch("builtins.print"):
+            resultado = self.provider.listar_videos(contexto="roteiro qualquer")
+
+        mock_buscar.assert_not_called()
+        self.assertEqual(resultado, itens_em_cache)
+        self.assertEqual(self.provider._downloads_nesta_execucao, 0)
+
+    def test_cache_hits_nao_consomem_orcamento_mesmo_misturados_com_novos(self):
+        # 1 já em cache (grátis) + candidatos novos, com orçamento residual = 2
+        self.provider._downloads_nesta_execucao = 4
+        self.provider._metadata = {
+            "9": {"caminho": "/tmp/cache_teste_orcamento_residual/9.mp4", "baixado_em": time.time(), "query": "x"}
+        }
+        with mock.patch.object(
+            self.provider, "_videos_em_cache_validos", return_value=[_media_item("9.mp4")]
+        ), mock.patch.object(
+            self.provider, "_buscar", return_value=[self._video(1), self._video(2), self._video(3)]
+        ), mock.patch.object(self.provider, "_baixar_arquivo", return_value=True), mock.patch.object(
+            self.provider, "_salvar_metadata"
+        ), mock.patch(
+            "builtins.print"
+        ):
+            resultado = self.provider.listar_videos(contexto="roteiro qualquer")
+
+        # 1 do cache (grátis) + no máximo 2 novos (orçamento residual) = 3
+        self.assertEqual(len(resultado), 3)
+        self.assertEqual(self.provider._downloads_nesta_execucao, 6)
+
+
+class TestMontarFundoMultiploPoolLazy(unittest.TestCase):
+    def _cenario_2_trechos(self):
+        segmentos = [(0.0, 3.0), (3.0, 6.0)]
+        palavras = [_palavra("um", 0.0, 0.5, 0), _palavra("dois", 3.0, 3.5, 1)]
+        return segmentos, palavras, []
+
+    def test_pool_nao_e_buscado_quando_contextual_atende_todos_os_trechos(self):
+        segmentos, palavras, grupos = self._cenario_2_trechos()
+        manager = mock.MagicMock()
+        manager.escolher_video_contextual.side_effect = ["c1.mp4", "c2.mp4"]
+
+        with mock.patch("bot_main._preparar_clip_de_fundo", return_value=FakeClip()), mock.patch(
+            "bot_main._aplicar_ken_burns", side_effect=lambda clip, *a, **k: clip
+        ), mock.patch("bot_main.concatenate_videoclips", side_effect=lambda clips, **kw: FakeClip()), mock.patch(
+            "builtins.print"
+        ):
+            _, caminhos_usados = bot_main._montar_fundo_multiplo(
+                segmentos, [], grupos, palavras, "roteiro", [], manager
+            )
+
+        manager.escolher_videos.assert_not_called()  # pré-busca nunca foi necessária
+        self.assertEqual(caminhos_usados, ["c1.mp4", "c2.mp4"])
+
+    def test_pool_e_buscado_sob_demanda_quando_contextual_falha_num_trecho(self):
+        segmentos, palavras, grupos = self._cenario_2_trechos()
+        manager = mock.MagicMock()
+        manager.escolher_video_contextual.side_effect = ["c1.mp4", None]
+        manager.escolher_videos.return_value = ["reserva.mp4"]
+
+        with mock.patch("bot_main._preparar_clip_de_fundo", return_value=FakeClip()), mock.patch(
+            "bot_main._aplicar_ken_burns", side_effect=lambda clip, *a, **k: clip
+        ), mock.patch("bot_main.concatenate_videoclips", side_effect=lambda clips, **kw: FakeClip()), mock.patch(
+            "builtins.print"
+        ):
+            _, caminhos_usados = bot_main._montar_fundo_multiplo(
+                segmentos, [], grupos, palavras, "roteiro", [], manager
+            )
+
+        manager.escolher_videos.assert_called_once_with(contexto="roteiro", quantidade=bot_main.BROLL_MAX_SEGMENTOS)
+        self.assertEqual(caminhos_usados, ["c1.mp4", "reserva.mp4"])
+
+    def test_pool_e_buscado_apenas_uma_vez_mesmo_com_varios_trechos_sem_contextual(self):
+        segmentos = [(0.0, 2.0), (2.0, 4.0), (4.0, 6.0)]
+        palavras = [_palavra("um", 0.0, 0.5, 0)]
+        manager = mock.MagicMock()
+        manager.escolher_video_contextual.return_value = None
+        manager.escolher_videos.return_value = ["reserva.mp4"]
+
+        with mock.patch("bot_main._preparar_clip_de_fundo", return_value=FakeClip()), mock.patch(
+            "bot_main._aplicar_ken_burns", side_effect=lambda clip, *a, **k: clip
+        ), mock.patch("bot_main.concatenate_videoclips", side_effect=lambda clips, **kw: FakeClip()), mock.patch(
+            "builtins.print"
+        ):
+            bot_main._montar_fundo_multiplo(segmentos, [], [], palavras, "roteiro", [], manager)
+
+        manager.escolher_videos.assert_called_once()
+
+    def test_sem_media_manager_e_pool_vazio_levanta_fundo_invalido_imediatamente(self):
+        segmentos, palavras, grupos = self._cenario_2_trechos()
+        with self.assertRaises(bot_main.FundoInvalidoError):
+            bot_main._montar_fundo_multiplo(segmentos, [], grupos, palavras, "roteiro", [], None)
+
+    def test_sem_media_manager_com_pool_pre_populado_funciona_como_antes(self):
+        segmentos, palavras, grupos = self._cenario_2_trechos()
+        with mock.patch("bot_main._preparar_clip_de_fundo", return_value=FakeClip()), mock.patch(
+            "bot_main._aplicar_ken_burns", side_effect=lambda clip, *a, **k: clip
+        ), mock.patch("bot_main.concatenate_videoclips", side_effect=lambda clips, **kw: FakeClip()), mock.patch(
+            "builtins.print"
+        ):
+            _, caminhos_usados = bot_main._montar_fundo_multiplo(
+                segmentos, ["pool.mp4"], grupos, palavras, "roteiro", [], None
+            )
+        self.assertEqual(caminhos_usados, ["pool.mp4", "pool.mp4"])
+
+
 if __name__ == "__main__":
     unittest.main()
