@@ -3876,7 +3876,17 @@ def criar_video(
     """
     print("🎬 [3/4] Montando vídeo final com legendas dinâmicas e design pro...")
 
-    if not caminhos_video_fundo:
+    # (Fase 2.1.1 → correção B/C, 2ª parte) Este guard é INDEPENDENTE do
+    # guard equivalente dentro de `_montar_fundo_multiplo()` — os dois
+    # existiam antes da mudança C, quando `caminhos_video_fundo` nunca
+    # chegava vazio de propósito (era sempre pré-buscado eager por
+    # `escolher_fundo_e_criar_video()`). Agora que o pool é lazy, uma lista
+    # vazia É o caso normal sempre que há `media_manager` (o pool só é
+    # buscado sob demanda, de dentro de `_montar_fundo_multiplo()`, se
+    # algum trecho realmente precisar dele) — só é erro fatal aqui, ainda
+    # ANTES de qualquer transcrição/segmentação, quando não há
+    # `media_manager` nenhum para eventualmente suprir isso mais adiante.
+    if not caminhos_video_fundo and media_manager is None:
         raise FundoInvalidoError("❌ Nenhum vídeo de fundo disponível para montar o Short.")
 
     # Referências guardadas à parte para garantir o fechamento de todos os
