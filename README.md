@@ -1,21 +1,29 @@
-# 🤖 YouTube Shorts Automation Bot
+# YouTube Shorts Automation Bot
 
-O **bot-shorts-yt** é uma ferramenta de automação desenvolvida em Python para otimizar e escalar o fluxo de criação, edição e publicação de vídeos no formato vertical para o **YouTube Shorts**.
+Automatiza a criação e publicação diária de YouTube Shorts: gera um roteiro com Gemini, produz narração por TTS, monta vídeo vertical com B-roll e legendas sincronizadas e publica pela YouTube Data API.
 
----
+## Requisitos
 
-### 🚀 Funcionalidades
+- Python 3.14 e FFmpeg.
+- ImageMagick com as fontes DejaVu instaladas (necessário para renderizar legendas).
+- Dependências Python: `python -m pip install -r requirements.txt`.
 
-* **Geração de Conteúdo:** Integração com APIs para obtenção automática de roteiros, textos ou mídias.
-* **Processamento de Mídia:** Renderização no formato 9:16 com aplicação de áudio, legendas automáticas e edições dinâmicas.
-* **Upload Automatizado:** Publicação direta no canal via **YouTube Data API v3** com definição automática de títulos, descrições e hashtags.
-* **Gerenciamento Seguro:** Tratamento de credenciais e tokens através de variáveis de ambiente (`.env`).
+## Configuração
 
----
+O programa lê credenciais diretamente das variáveis de ambiente; não carrega arquivos `.env`. No GitHub Actions, configure estes GitHub Secrets:
 
-### 🛠️ Tecnologias Utilizadas
+- `GEMINI_API_KEY` e `YOUTUBE_TOKEN_JSON` (obrigatórios).
+- Pelo menos um provedor de voz: `OPENAI_API_KEY`, `GOOGLE_TTS_API_KEY` ou `ELEVENLABS_API_KEY`.
+- `PEXELS_API_KEY` é opcional; sem ela, o bot usa os vídeos locais.
 
-* **Linguagem:** Python
-* **Automação & APIs:** YouTube Data API v3, Google OAuth 2.0
-* **Processamento de Vídeo/Áudio:** FFmpeg / MoviePy
-* **Utilitários:** `python-dotenv`
+Para execução local, exporte as mesmas variáveis no shell antes de iniciar `python bot_main.py`. Não adicione credenciais ao repositório.
+
+## Execução e testes
+
+O workflow em `.github/workflows/agendador.yml` publica diariamente às 18:00 UTC e também pode ser iniciado manualmente no GitHub Actions. O upload está configurado como público.
+
+Execute os testes unitários com:
+
+```sh
+python -m unittest discover -s tests -v
+```

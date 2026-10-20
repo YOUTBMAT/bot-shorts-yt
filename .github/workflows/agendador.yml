@@ -56,7 +56,21 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel
           pip install -r requirements.txt
 
-      - name: 7. Executar o Bot Automatico
+      - name: 7. Testar o projeto
+        run: python -m unittest discover -s tests -v
+
+      - name: Preparar diretório do cache Pexels
+        run: mkdir -p cache/pexels
+
+      - name: 8. Cache da biblioteca de mídia Pexels
+        uses: actions/cache@v4
+        with:
+          path: cache/pexels
+          key: ${{ runner.os }}-python-3.14-pexels-${{ hashFiles('requirements.txt') }}-${{ github.run_id }}
+          restore-keys: |
+            ${{ runner.os }}-python-3.14-pexels-${{ hashFiles('requirements.txt') }}-
+
+      - name: 9. Executar o Bot Automatico
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           # Opcional: sem essa secret configurada, este provedor simplesmente

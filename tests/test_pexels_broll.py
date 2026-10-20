@@ -33,6 +33,7 @@ import json
 import os
 import random
 import sys
+import tempfile
 import time
 import types
 import unittest
@@ -451,6 +452,54 @@ class TestPexelsBusca(unittest.TestCase):
         for chamada in mock_print.call_args_list:
             texto_logado = " ".join(str(a) for a in chamada.args)
             self.assertNotIn("chave-de-teste-1234567890", texto_logado)
+
+
+class TestPexelsCacheFiles(unittest.TestCase):
+    def test_download_grava_em_blocos_em_vez_de_ler_o_video_inteiro(self):
+        provider = bot_main.PexelsMediaProvider.__new__(bot_main.PexelsMediaProvider)
+        resposta = mock.MagicMock()
+        resposta.read.side_effect = [b"bloco-1", b"bloco-2", b""]
+        resposta.__enter__.return_value = resposta
+        resposta.__exit__.return_value = False
+
+        with tempfile.TemporaryDirectory() as pasta:
+            destino = os.path.join(pasta, "video.mp4")
+            with mock.patch("bot_main.urllib.request.urlopen", return_value=resposta):
+                self.assertTrue(provider._baixar_arquivo("https://cdn/video.mp4", destino))
+
+            with open(destino, "rb") as arquivo:
+                self.assertEqual(arquivo.read(), b"bloco-1bloco-2")
+        self.assertEqual(resposta.read.call_count, 3)
+
+    def test_limpeza_remove_orfaos_sem_remover_arquivos_fora_do_cache(self):
+        provider = bot_main.PexelsMediaProvider.__new__(bot_main.PexelsMediaProvider)
+        with tempfile.TemporaryDirectory() as pasta:
+            pasta_cache = os.path.join(pasta, "cache")
+            os.makedirs(pasta_cache)
+            expirado = os.path.join(pasta_cache, "expirado.mp4")
+            orfao = os.path.join(pasta_cache, "orfao.mp4")
+            temporario = os.path.join(pasta_cache, "metadata.json.tmp")
+            externo = os.path.join(pasta, "nao-apagar.mp4")
+            for caminho in (expirado, orfao, temporario, externo):
+                with open(caminho, "wb") as arquivo:
+                    arquivo.write(b"video")
+            provider.cache_dir = pasta_cache
+            provider.metadata_path = os.path.join(pasta_cache, "metadata.json")
+            provider._metadata = {
+                "expirado": {
+                    "caminho": expirado,
+                    "baixado_em": time.time() - (bot_main.CACHE_TTL_HOURS + 1) * 3600,
+                },
+                "externo": {"caminho": externo, "baixado_em": time.time()},
+            }
+
+            provider.limpar_cache_expirado()
+
+            self.assertFalse(os.path.exists(expirado))
+            self.assertFalse(os.path.exists(orfao))
+            self.assertFalse(os.path.exists(temporario))
+            self.assertTrue(os.path.exists(externo))
+            self.assertEqual(provider._metadata, {})
 
 
 # ===========================================================================
@@ -1006,13 +1055,19 @@ class TestPexelsUserAgentECloudflare(unittest.TestCase):
         capturado = {}
 
         class _RespostaFake:
+            def __init__(self):
+                self.lido = False
+
             def __enter__(self):
                 return self
 
             def __exit__(self, *a):
                 return False
 
-            def read(self):
+            def read(self, _tamanho=-1):
+                if self.lido:
+                    return b""
+                self.lido = True
                 return b"conteudo-fake-de-video"
 
         def fake_urlopen(requisicao, timeout=None):
@@ -1217,6 +1272,64 @@ class TestPontuarCandidatoBroll(unittest.TestCase):
         score_com_folga = bot_main._pontuar_candidato_broll(video_com_folga, arquivo, 0, 4, duracao_alvo=6.0)
         self.assertGreater(score_com_folga, score_no_limite)
 
+    def test_path_do_video_usado_aplica_penalidade_ao_id_pexels_correspondente(self):
+        arquivo = self._arquivo()
+        video_usado = self._video(id=42)
+        video_novo = self._video(id=43)
+        for video in (video_usado, video_novo):
+            video["video_files"] = [
+                {"width": 1920, "height": 1080, "fps": 30, "link": f"https://cdn/{video['id']}.mp4"}
+            ]
+
+        provider = bot_main.PexelsMediaProvider.__new__(bot_main.PexelsMediaProvider)
+        provider.api_key = "chave-de-teste"
+        provider.cache_dir = "/tmp/cache_teste_score_path"
+        provider.metadata_path = "/tmp/cache_teste_score_path/metadata.json"
+        provider._metadata = {}
+        provider._rejeitados_nesta_execucao = set()
+        provider._cache_busca_execucao = {"q1": [video_usado, video_novo]}
+        provider._downloads_nesta_execucao = 0
+        with mock.patch.object(provider, "_baixar_arquivo", return_value=True), mock.patch.object(
+            provider, "_salvar_metadata"
+        ), mock.patch("builtins.print"):
+            itens = provider._buscar_com_fallback_de_queries(
+                ["q1"], duracao_alvo=6.0, ids_evitar={"/tmp/cache_teste_score_path/42.mp4"}
+            )
+
+        self.assertEqual(os.path.basename(itens[0].caminho), "43.mp4")
+
+
+class TestLegendaAtiva(unittest.TestCase):
+    def test_tile_ativo_preserva_a_sombra_composta(self):
+        import numpy as np
+
+        class FakeTextClip:
+            def __init__(self, _texto, **kwargs):
+                self.w = 8
+                self.h = 8
+                self.mask = None
+                self.cor = (0, 0, 0) if kwargs.get("color") == "black" else (255, 209, 0)
+                self.fechado = False
+
+            def set_opacity(self, _opacidade):
+                return self
+
+            def get_frame(self, _tempo):
+                if self.fechado:
+                    raise RuntimeError("clip fechado")
+                return np.full((self.h, self.w, 3), self.cor, dtype=np.uint8)
+
+            def close(self):
+                self.fechado = True
+
+        bot_main._resetar_cache_legendas()
+        with mock.patch.object(bot_main, "TextClip", FakeTextClip):
+            rgb, alpha = bot_main._obter_tile_palavra("teste", "ativa")
+
+        self.assertEqual(rgb.shape[:2], (8 + bot_main.LEGEND_SHADOW_OFFSET[1], 8 + bot_main.LEGEND_SHADOW_OFFSET[0]))
+        self.assertTrue(np.any(alpha[:, -bot_main.LEGEND_SHADOW_OFFSET[0]:] > 0))
+        self.assertTrue(np.all(rgb[:, -bot_main.LEGEND_SHADOW_OFFSET[0]:] == 0))
+
 
 # ===========================================================================
 # 19. PexelsMediaProvider._buscar_com_fallback_de_queries() — cascata,
@@ -1354,6 +1467,20 @@ class FakeMediaProviderContextual(bot_main.MediaProvider):
 
 
 class TestEscolherVideoContextual(unittest.TestCase):
+    def test_relevancia_contextual_prevalece_sobre_historico(self):
+        melhor = bot_main.MediaItem("melhor.mp4", "pexels", "video", pontuacao=90.0)
+        pior = bot_main.MediaItem("pior.mp4", "pexels", "video", pontuacao=50.0)
+        provider = FakeMediaProviderContextual(itens_padrao=[pior, melhor])
+        manager = bot_main.MediaManager(
+            provider=provider, provider_fallback=None, arquivo_historico="/tmp/hist_ctx_score.json"
+        )
+        manager._historico = ["melhor.mp4"]
+
+        with mock.patch("builtins.print"):
+            resultado = manager.escolher_video_contextual("tema", duracao_alvo=6.0)
+
+        self.assertEqual(resultado, "melhor.mp4")
+
     def test_repassa_texto_e_duracao_ao_provider(self):
         item = _media_item("saturno.mp4")
         provider = FakeMediaProviderContextual(resposta_por_texto={"saturno tem aneis": [item]})

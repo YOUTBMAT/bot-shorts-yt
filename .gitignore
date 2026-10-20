@@ -1,1 +1,11 @@
 token.json
+.env
+.env.*
+!.env.example
+__pycache__/
+*.py[cod]
+cache/
+media_history.json
+narracao.mp3
+video_final.mp4
+debug_render/

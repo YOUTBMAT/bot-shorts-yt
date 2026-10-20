@@ -1,6 +1,7 @@
 """Modelos de dominio compartilhados pela biblioteca de midia."""
 
 from dataclasses import dataclass
+from typing import Optional
 
 
 class FundoInvalidoError(RuntimeError):
@@ -14,3 +15,4 @@ class MediaItem:
     caminho: str
     categoria: str
     tipo: str
+    pontuacao: Optional[float] = None

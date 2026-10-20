@@ -938,27 +938,59 @@ class PexelsMediaProvider(MediaProvider):
         try:
             with open(self.metadata_path, "r", encoding="utf-8") as arquivo:
                 dados = json.load(arquivo)
-            return dados if isinstance(dados, dict) else {}
+            if not isinstance(dados, dict):
+                return {}
+            return {
+                video_id: entrada
+                for video_id, entrada in dados.items()
+                if isinstance(entrada, dict)
+            }
         except (OSError, json.JSONDecodeError):
             return {}
 
     def _salvar_metadata(self) -> None:
+        temporario = self.metadata_path + ".tmp"
         try:
             os.makedirs(os.path.dirname(self.metadata_path) or ".", exist_ok=True)
-            with open(self.metadata_path, "w", encoding="utf-8") as arquivo:
+            with open(temporario, "w", encoding="utf-8") as arquivo:
                 json.dump(self._metadata, arquivo, ensure_ascii=False, indent=2)
+            os.replace(temporario, self.metadata_path)
         except OSError as err:
             # Nunca derruba a execução por causa do cache — é só uma
             # otimização de banda/quota, não uma etapa crítica.
             print(f"⚠️ Pexels: não foi possível salvar cache ({err}); seguindo sem persistir.")
+            if os.path.exists(temporario):
+                try:
+                    os.remove(temporario)
+                except OSError as cleanup_err:
+                    print(f"⚠️ Pexels: não foi possível limpar '{temporario}' ({cleanup_err}).")
+
+    def _caminho_dentro_do_cache(self, caminho: object) -> Optional[str]:
+        if not isinstance(caminho, str) or not caminho:
+            return None
+        caminho_absoluto = os.path.abspath(caminho)
+        raiz_cache = os.path.realpath(self.cache_dir)
+        try:
+            if os.path.commonpath((raiz_cache, os.path.realpath(caminho_absoluto))) != raiz_cache:
+                return None
+        except ValueError:
+            return None
+        return caminho_absoluto
 
     def _cache_valido(self, entrada: dict) -> bool:
+        if not isinstance(entrada, dict):
+            return False
         caminho = entrada.get("caminho")
         baixado_em = entrada.get("baixado_em", 0)
-        if not caminho or not os.path.exists(caminho):
+        caminho_cache = self._caminho_dentro_do_cache(caminho)
+        if (
+            caminho_cache is None
+            or not isinstance(baixado_em, (int, float))
+            or not os.path.isfile(caminho_cache)
+        ):
             return False
         idade_horas = (time.time() - baixado_em) / 3600
-        return idade_horas < CACHE_TTL_HOURS
+        return 0 <= idade_horas < CACHE_TTL_HOURS
 
     def _videos_em_cache_validos(self) -> List[MediaItem]:
         """Retorna os itens de cache ainda válidos e, de quebra, expurga do
@@ -1250,7 +1282,11 @@ class PexelsMediaProvider(MediaProvider):
             requisicao = urllib.request.Request(url, headers={"User-Agent": PEXELS_USER_AGENT})
             with urllib.request.urlopen(requisicao, timeout=PEXELS_TIMEOUT_SECONDS) as resposta:
                 with open(temporario, "wb") as arquivo_saida:
-                    arquivo_saida.write(resposta.read())
+                    while True:
+                        bloco = resposta.read(1024 * 1024)
+                        if not bloco:
+                            break
+                        arquivo_saida.write(bloco)
         except (urllib.error.URLError, urllib.error.HTTPError, socket.timeout, OSError) as err:
             print(f"⚠️ Pexels: falha ao baixar '{url}' ({err}).")
             if os.path.exists(temporario):
@@ -1385,6 +1421,10 @@ class PexelsMediaProvider(MediaProvider):
         validação completa."""
         candidatos_pontuados: List[Tuple[float, dict, dict, str, str, int]] = []
         total_queries = max(1, len(queries))
+        ids_evitar_video = {
+            os.path.splitext(os.path.basename(str(identificador)))[0]
+            for identificador in ids_evitar
+        }
 
         for indice_query, query in enumerate(queries):
             if len({c[3] for c in candidatos_pontuados}) >= BROLL_CANDIDATOS_POR_TRECHO_ALVO:
@@ -1419,7 +1459,6 @@ class PexelsMediaProvider(MediaProvider):
             rejeitados_ja_descartado = 0
             rejeitados_sem_arquivo_utilizavel = 0
             validos_desta_query = 0
-
             for video in resultados:
                 duracao = video.get("duration", 0)
                 if duracao < MEDIA_VIDEO_DURACAO_MINIMA:
@@ -1434,7 +1473,7 @@ class PexelsMediaProvider(MediaProvider):
                     rejeitados_sem_arquivo_utilizavel += 1
                     continue
                 score = _pontuar_candidato_broll(
-                    video, arquivo, indice_query, total_queries, duracao_alvo, ids_evitar
+                    video, arquivo, indice_query, total_queries, duracao_alvo, ids_evitar_video
                 )
                 candidatos_pontuados.append((score, video, arquivo, video_id, query, indice_query))
                 validos_desta_query += 1
@@ -1460,7 +1499,12 @@ class PexelsMediaProvider(MediaProvider):
                 candidatos_pontuados[:limite_exibicao], start=1
             ):
                 c = _componentes_score_candidato_broll(
-                    video, arquivo, indice_q, total_queries, duracao_alvo, ids_evitar
+                    video,
+                    arquivo,
+                    indice_q,
+                    total_queries,
+                    duracao_alvo,
+                    ids_evitar_video,
                 )
                 print(
                     f"   {posicao}. video_id={video_id} score={score:.1f} (query=\"{query_origem}\")"
@@ -1503,6 +1547,7 @@ class PexelsMediaProvider(MediaProvider):
                         caminho=self._metadata[video_id]["caminho"],
                         categoria=f"pexels/score={score:.1f}/fonte=cache",
                         tipo="video",
+                        pontuacao=score,
                     )
                 )
                 continue
@@ -1527,7 +1572,12 @@ class PexelsMediaProvider(MediaProvider):
                 "query": query_origem,
             }
             itens.append(
-                MediaItem(caminho=destino, categoria=f"pexels/score={score:.1f}/fonte=api", tipo="video")
+                MediaItem(
+                    caminho=destino,
+                    categoria=f"pexels/score={score:.1f}/fonte=api",
+                    tipo="video",
+                    pontuacao=score,
+                )
             )
 
         if itens:
@@ -1572,21 +1622,30 @@ class PexelsMediaProvider(MediaProvider):
         acumular espaço em disco entre execuções do runner."""
         for video_id, entrada in list(self._metadata.items()):
             if not self._cache_valido(entrada):
-                caminho = entrada.get("caminho")
-                if caminho and os.path.exists(caminho):
+                caminho_cache = self._caminho_dentro_do_cache(entrada.get("caminho"))
+                if caminho_cache and os.path.exists(caminho_cache):
                     try:
-                        os.remove(caminho)
-                    except OSError:
-                        pass
+                        os.remove(caminho_cache)
+                    except OSError as err:
+                        print(f"⚠️ Pexels: não foi possível remover cache expirado '{caminho_cache}' ({err}).")
                 self._metadata.pop(video_id, None)
 
         if os.path.isdir(self.cache_dir):
+            caminhos_referenciados = {
+                caminho_cache
+                for entrada in self._metadata.values()
+                if (caminho_cache := self._caminho_dentro_do_cache(entrada.get("caminho")))
+            }
             for nome in os.listdir(self.cache_dir):
-                if nome.endswith(".part"):
+                caminho = os.path.abspath(os.path.join(self.cache_dir, nome))
+                if os.path.isfile(caminho) and (
+                    nome.endswith((".part", ".tmp"))
+                    or (nome.endswith(".mp4") and caminho not in caminhos_referenciados)
+                ):
                     try:
-                        os.remove(os.path.join(self.cache_dir, nome))
-                    except OSError:
-                        pass
+                        os.remove(caminho)
+                    except OSError as err:
+                        print(f"⚠️ Pexels: não foi possível limpar arquivo órfão '{caminho}' ({err}).")
 
         self._salvar_metadata()
 
@@ -1838,7 +1897,11 @@ class MediaManager:
         # como desempate leve e estável, nunca reordenando por score.
         ordem = sorted(
             candidatos,
-            key=lambda item: item.caminho in no_historico or item.caminho in excluir,
+            key=lambda item: (
+                item.pontuacao if item.pontuacao is not None else float("-inf"),
+                item.caminho not in no_historico and item.caminho not in excluir,
+            ),
+            reverse=True,
         )
 
         tentativas = 0
@@ -3109,30 +3172,35 @@ def _obter_tile_palavra(texto: str, estilo: str) -> Tuple[np.ndarray, np.ndarray
                 texto, fontsize=LEGEND_FONT_SIZE, font=LEGEND_FONT, color=ACTIVE_COLOR,
                 stroke_color=STROKE_COLOR, stroke_width=STROKE_WIDTH, method="label",
             )
-            clip_sombra = TextClip(
-                texto, fontsize=LEGEND_FONT_SIZE, font=LEGEND_FONT, color="black", method="label",
-            ).set_opacity(LEGEND_SHADOW_OPACITY)
+            clip_sombra = None
+            try:
+                clip_sombra = TextClip(
+                    texto, fontsize=LEGEND_FONT_SIZE, font=LEGEND_FONT, color="black", method="label",
+                ).set_opacity(LEGEND_SHADOW_OPACITY)
 
-            largura = max(clip_texto.w, clip_sombra.w + LEGEND_SHADOW_OFFSET[0])
-            altura = max(clip_texto.h, clip_sombra.h + LEGEND_SHADOW_OFFSET[1])
-            canvas_rgb = np.zeros((altura, largura, 3), dtype=np.uint8)
-            canvas_alpha = np.zeros((altura, largura), dtype=np.float32)
+                largura = max(clip_texto.w, clip_sombra.w + LEGEND_SHADOW_OFFSET[0])
+                altura = max(clip_texto.h, clip_sombra.h + LEGEND_SHADOW_OFFSET[1])
+                canvas_rgb = np.zeros((altura, largura, 3), dtype=np.uint8)
+                canvas_alpha = np.zeros((altura, largura), dtype=np.float32)
 
-            sombra_rgb, sombra_alpha = _obter_frame_e_alpha(clip_sombra)
-            _colar_tile(canvas_rgb, canvas_alpha, sombra_rgb, sombra_alpha, *LEGEND_SHADOW_OFFSET)
+                sombra_rgb, sombra_alpha = _obter_frame_e_alpha(clip_sombra)
+                _colar_tile(canvas_rgb, canvas_alpha, sombra_rgb, sombra_alpha, *LEGEND_SHADOW_OFFSET)
 
-            texto_rgb, texto_alpha = _obter_frame_e_alpha(clip_texto)
-            _colar_tile(canvas_rgb, canvas_alpha, texto_rgb, texto_alpha, 0, 0)
-
-            clip_texto.close()
-            clip_sombra.close()
-            resultado = (canvas_rgb, canvas_alpha)
+                texto_rgb, texto_alpha = _obter_frame_e_alpha(clip_texto)
+                _colar_tile(canvas_rgb, canvas_alpha, texto_rgb, texto_alpha, 0, 0)
+                resultado = (canvas_rgb, canvas_alpha)
+            finally:
+                clip_texto.close()
+                if clip_sombra is not None:
+                    clip_sombra.close()
         else:
             clip_texto = TextClip(
                 texto, fontsize=LEGEND_FONT_SIZE, font=LEGEND_FONT, color=NORMAL_COLOR, method="label",
-        )
-        resultado = tuple(a.copy() for a in _obter_frame_e_alpha(clip_texto))
-        clip_texto.close()
+            )
+            try:
+                resultado = tuple(a.copy() for a in _obter_frame_e_alpha(clip_texto))
+            finally:
+                clip_texto.close()
     except Exception as err:
         raise RuntimeError(
             f"❌ ImageMagick: falha ao renderizar o texto da legenda ('{texto}'). "
