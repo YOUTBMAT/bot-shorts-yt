@@ -1780,31 +1780,37 @@ def escolher_fundo_e_criar_video(
 def validar_video_final(caminho_video: str) -> bool:
     """Confirma os requisitos técnicos do arquivo de vídeo renderizado."""
     if not os.path.isfile(caminho_video):
+        print(f"❌ Falha na validação: arquivo vazio ou inexistente em {caminho_video}")
         return False
 
     try:
         if os.path.getsize(caminho_video) <= 0:
+            print(f"❌ Falha na validação: arquivo vazio ou inexistente em {caminho_video}")
             return False
-    except OSError:
+    except OSError as err:
+        print(f"❌ Falha na validação: não foi possível verificar o arquivo {caminho_video} ({err})")
         return False
 
     clip = None
     valido = False
     try:
         clip = VideoFileClip(caminho_video)
-        valido = (
-            clip.size == (1080, 1920)
-            and clip.audio is not None
-            and clip.duration is not None
-            and clip.duration > 0
-        )
-    except Exception:
-        valido = False
+        if clip.size != (1080, 1920):
+            print(f"❌ Falha na validação: dimensões incorretas {clip.size} (esperado 1080x1920)")
+        elif clip.audio is None:
+            print("❌ Falha na validação: o vídeo não possui faixa de áudio (clip.audio is None)")
+        elif clip.duration is None or clip.duration <= 0:
+            print(f"❌ Falha na validação: duração inválida {clip.duration} (esperado > 0)")
+        else:
+            valido = True
+    except Exception as err:
+        print(f"❌ Falha na validação: erro ao inspecionar o vídeo {caminho_video} ({err})")
     finally:
         if clip is not None:
             try:
                 clip.close()
-            except Exception:
+            except Exception as err:
+                print(f"❌ Falha na validação: erro ao fechar o clip de vídeo ({err})")
                 valido = False
 
     return valido
