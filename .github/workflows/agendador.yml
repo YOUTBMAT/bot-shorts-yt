@@ -96,7 +96,7 @@ jobs:
 
           for path in media_history.json estado_publicacao.json cache; do
             if [ -e "$path" ]; then
-              git add -A -- "$path"
+              git add -A -f -- "$path"
             elif git ls-files --error-unmatch "$path" >/dev/null 2>&1; then
               git add -u -- "$path"
             fi
