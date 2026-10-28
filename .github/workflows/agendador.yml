@@ -89,12 +89,12 @@ jobs:
         run: |
           python bot_main.py
 
-      - name: 10. Persistir historico e cache
+      - name: 10. Persistir estado de publicação
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          for path in media_history.json estado_publicacao.json cache; do
+          for path in media_history.json estado_publicacao.json; do
             if [ -e "$path" ]; then
               git add -A -f -- "$path"
             elif git ls-files --error-unmatch "$path" >/dev/null 2>&1; then
@@ -102,9 +102,9 @@ jobs:
             fi
           done
 
-          if ! git diff --cached --quiet -- media_history.json estado_publicacao.json cache/; then
+          if ! git diff --cached --quiet -- media_history.json estado_publicacao.json; then
             git commit -m "Persist bot publication state"
             git push
           else
-            echo "Nenhuma mudança nos arquivos de estado ou cache."
+            echo "Nenhuma mudança nos arquivos de estado."
           fi
