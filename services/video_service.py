@@ -1821,7 +1821,8 @@ def validar_video_final(caminho_video: str) -> bool:
     valido = False
     try:
         clip = VideoFileClip(caminho_video)
-        if clip.size != (1080, 1920):
+        largura, altura = clip.size
+        if largura != 1080 or altura != 1920:
             print(f"❌ Falha na validação: dimensões incorretas {clip.size} (esperado 1080x1920)")
         elif clip.audio is None:
             print("❌ Falha na validação: o vídeo não possui faixa de áudio (clip.audio is None)")
