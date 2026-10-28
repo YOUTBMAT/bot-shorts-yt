@@ -15,14 +15,11 @@ Cobre, na ordem pedida:
 11. Mídia descartada não entra no histórico.
 12. Retry não escolhe imediatamente o mesmo vídeo descartado/já usado.
 
-Este projeto não tem framework de testes prévio nem dependência de teste
-declarada — por isso os testes usam só `unittest` (stdlib) e, para poder
-importar `bot_main.py` sem precisar instalar toda a stack pesada
-(moviepy, faster-whisper, google-genai, elevenlabs, openai,
-google-api-python-client...), os módulos externos são substituídos por
-stubs mínimos ANTES do import. Isso testa a lógica de verdade do módulo
-(constantes, `PexelsMediaProvider`, `MediaManager`, as novas funções de
-B-roll) sem depender de infraestrutura externa (rede, GPU, ffmpeg) — o
+este projeto não tem framework de testes prévio nem dependência de teste
+declarada — por isso os testes usam `unittest` (stdlib) e substituem por
+stubs mínimos as dependências pesadas (como MoviePy e faster-whisper)
+antes de importar `services.media_service` e `services.video_service`.
+Isso testa a lógica dos serviços sem depender de rede, GPU ou ffmpeg — o
 que é apropriado para rodar em CI/GitHub Actions de forma rápida.
 
 Rodar com:  python -m unittest tests.test_pexels_broll -v
@@ -54,10 +51,7 @@ def _stub_module(name: str, **attrs) -> types.ModuleType:
 
 
 def _instalar_stubs_de_dependencias_pesadas() -> None:
-    """Registra stubs em sys.modules para toda dependência pesada/externa
-    que `bot_main.py` importa no topo do arquivo, SE ela ainda não
-    estiver instalada de verdade no ambiente. Não sobrescreve um pacote
-    real já instalado (permite rodar com ou sem a stack completa)."""
+    """Registra stubs para dependências pesadas que não estejam instaladas."""
 
     class _Generico:
         def __init__(self, *args, **kwargs):
@@ -155,13 +149,14 @@ def _instalar_stubs_de_dependencias_pesadas() -> None:
 
 
 _instalar_stubs_de_dependencias_pesadas()
-import bot_main  # noqa: E402  (import depois dos stubs, de propósito)
+from models.media import FundoInvalidoError, MediaItem  # noqa: E402
+from services import media_service, video_service  # noqa: E402
 
 
 # ===========================================================================
 # Dublês de teste (fakes) usados em vários casos abaixo
 # ===========================================================================
-class FakeMediaProvider(bot_main.MediaProvider):
+class FakeMediaProvider(media_service.MediaProvider):
     """MediaProvider totalmente controlável para testes: devolve exatamente
     os `MediaItem`s configurados, valida conforme uma lista/branco de
     aprovação, e registra descartes para inspeção."""
@@ -184,8 +179,8 @@ class FakeMediaProvider(bot_main.MediaProvider):
         self.descartados.append(item)
 
 
-def _media_item(caminho: str) -> bot_main.MediaItem:
-    return bot_main.MediaItem(caminho=caminho, categoria="teste", tipo="video")
+def _media_item(caminho: str) -> MediaItem:
+    return MediaItem(caminho=caminho, categoria="teste", tipo="video")
 
 
 class FakeClip:
@@ -218,7 +213,7 @@ class FakeClip:
 # ===========================================================================
 class TestQueriesVisuais(unittest.TestCase):
     def setUp(self):
-        self.provider = bot_main.PexelsMediaProvider.__new__(bot_main.PexelsMediaProvider)
+        self.provider = media_service.PexelsMediaProvider.__new__(media_service.PexelsMediaProvider)
 
     def test_saturno_gera_queries_visuais_em_ingles(self):
         roteiro = "Saturno possui aneis formados por milhoes de particulas ha bilhoes de anos."
@@ -249,7 +244,7 @@ class TestQueriesVisuais(unittest.TestCase):
             "cometa foguete astronauta satelite nasa gravidade oceano mar baleia tubarao"
         )
         queries = self.provider._gerar_queries_visuais(roteiro)
-        self.assertLessEqual(len(queries), bot_main.MAX_PALAVRAS_CHAVE_PESQUISA)
+        self.assertLessEqual(len(queries), media_service.MAX_PALAVRAS_CHAVE_PESQUISA)
 
 
 # ===========================================================================
@@ -262,7 +257,7 @@ class TestQueriesVisuaisSemanticas(unittest.TestCase):
     `CONCEITOS_CONTEXTUAIS_PT_EN` / `_gerar_queries_visuais()`."""
 
     def setUp(self):
-        self.provider = bot_main.PexelsMediaProvider.__new__(bot_main.PexelsMediaProvider)
+        self.provider = media_service.PexelsMediaProvider.__new__(media_service.PexelsMediaProvider)
 
     # --- Teste 1: palavras inúteis não viram query isolada ---------------
     def test_palavras_de_discurso_nunca_viram_query(self):
@@ -319,7 +314,7 @@ class TestQueriesVisuaisSemanticas(unittest.TestCase):
             "predador nadando atacando"
         )
         queries = self.provider._gerar_queries_visuais(texto)
-        self.assertLessEqual(len(queries), bot_main.MAX_PALAVRAS_CHAVE_PESQUISA)
+        self.assertLessEqual(len(queries), media_service.MAX_PALAVRAS_CHAVE_PESQUISA)
 
     # --- Teste 8: fallback quando não há candidato nenhum -----------------
     def test_texto_sem_conceito_visual_usa_fallback_generico_composto(self):
@@ -327,7 +322,7 @@ class TestQueriesVisuaisSemanticas(unittest.TestCase):
         queries = self.provider._gerar_queries_visuais(texto)
         self.assertTrue(len(queries) >= 1)
         for query in queries:
-            self.assertIn(query, bot_main.PEXELS_QUERIES_FALLBACK_GENERICAS)
+            self.assertIn(query, media_service.PEXELS_QUERIES_FALLBACK_GENERICAS)
 
     # --- Teste 9: acentuação não quebra o processamento --------------------
     def test_acentos_nao_quebram_geracao_de_queries(self):
@@ -346,7 +341,7 @@ class TestQueriesVisuaisSemanticas(unittest.TestCase):
         queries = self.provider._gerar_queries_visuais("")
         self.assertTrue(len(queries) >= 1)
         for query in queries:
-            self.assertIn(query, bot_main.PEXELS_QUERIES_FALLBACK_GENERICAS)
+            self.assertIn(query, media_service.PEXELS_QUERIES_FALLBACK_GENERICAS)
 
     # --- Teste 12: texto muito curto ----------------------------------------
     def test_texto_muito_curto_usa_fallback_seguro(self):
@@ -363,7 +358,7 @@ class TestQueriesVisuaisSemanticas(unittest.TestCase):
         self.assertIn("sperm whale", texto_unido)
 
     def test_fallback_generico_nunca_contem_palavra_solta_em_portugues(self):
-        for query in bot_main.PEXELS_QUERIES_FALLBACK_GENERICAS:
+        for query in media_service.PEXELS_QUERIES_FALLBACK_GENERICAS:
             self.assertGreaterEqual(len(query.split()), 2)
 
 
@@ -372,7 +367,7 @@ class TestQueriesVisuaisSemanticas(unittest.TestCase):
 # ===========================================================================
 class TestPexelsBusca(unittest.TestCase):
     def setUp(self):
-        self.provider = bot_main.PexelsMediaProvider.__new__(bot_main.PexelsMediaProvider)
+        self.provider = media_service.PexelsMediaProvider.__new__(media_service.PexelsMediaProvider)
         self.provider.api_key = "chave-de-teste-1234567890"
 
     def _mock_urlopen_sucesso(self, corpo: dict):
@@ -380,7 +375,7 @@ class TestPexelsBusca(unittest.TestCase):
         resposta.read.return_value = json.dumps(corpo).encode("utf-8")
         resposta.__enter__.return_value = resposta
         resposta.__exit__.return_value = False
-        return mock.patch("bot_main.urllib.request.urlopen", return_value=resposta)
+        return mock.patch("services.media_service.urllib.request.urlopen", return_value=resposta)
 
     def test_200_retorna_lista_de_videos(self):
         with self._mock_urlopen_sucesso({"videos": [{"id": 1}, {"id": 2}]}):
@@ -395,7 +390,7 @@ class TestPexelsBusca(unittest.TestCase):
             hdrs=None,
             fp=io.BytesIO(corpo),
         )
-        return mock.patch("bot_main.urllib.request.urlopen", side_effect=erro)
+        return mock.patch("services.media_service.urllib.request.urlopen", side_effect=erro)
 
     def test_401_mensagem_especifica_de_credencial(self):
         with self._mock_http_error(401):
@@ -429,7 +424,7 @@ class TestPexelsBusca(unittest.TestCase):
         self.assertIn("503", str(ctx.exception))
 
     def test_timeout_vira_runtimeerror(self):
-        with mock.patch("bot_main.urllib.request.urlopen", side_effect=TimeoutError("timed out")):
+        with mock.patch("services.media_service.urllib.request.urlopen", side_effect=TimeoutError("timed out")):
             with self.assertRaises(RuntimeError) as ctx:
                 self.provider._buscar("saturn rings")
         self.assertIn("timeout", str(ctx.exception).lower())
@@ -439,7 +434,7 @@ class TestPexelsBusca(unittest.TestCase):
         resposta.read.return_value = b"isto nao e json"
         resposta.__enter__.return_value = resposta
         resposta.__exit__.return_value = False
-        with mock.patch("bot_main.urllib.request.urlopen", return_value=resposta):
+        with mock.patch("services.media_service.urllib.request.urlopen", return_value=resposta):
             with self.assertRaises(RuntimeError) as ctx:
                 self.provider._buscar("saturn rings")
         self.assertIn("JSON", str(ctx.exception))
@@ -456,7 +451,7 @@ class TestPexelsBusca(unittest.TestCase):
 
 class TestPexelsCacheFiles(unittest.TestCase):
     def test_download_grava_em_blocos_em_vez_de_ler_o_video_inteiro(self):
-        provider = bot_main.PexelsMediaProvider.__new__(bot_main.PexelsMediaProvider)
+        provider = media_service.PexelsMediaProvider.__new__(media_service.PexelsMediaProvider)
         resposta = mock.MagicMock()
         resposta.read.side_effect = [b"bloco-1", b"bloco-2", b""]
         resposta.__enter__.return_value = resposta
@@ -464,7 +459,7 @@ class TestPexelsCacheFiles(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as pasta:
             destino = os.path.join(pasta, "video.mp4")
-            with mock.patch("bot_main.urllib.request.urlopen", return_value=resposta):
+            with mock.patch("services.media_service.urllib.request.urlopen", return_value=resposta):
                 self.assertTrue(provider._baixar_arquivo("https://cdn/video.mp4", destino))
 
             with open(destino, "rb") as arquivo:
@@ -472,7 +467,7 @@ class TestPexelsCacheFiles(unittest.TestCase):
         self.assertEqual(resposta.read.call_count, 3)
 
     def test_limpeza_remove_orfaos_sem_remover_arquivos_fora_do_cache(self):
-        provider = bot_main.PexelsMediaProvider.__new__(bot_main.PexelsMediaProvider)
+        provider = media_service.PexelsMediaProvider.__new__(media_service.PexelsMediaProvider)
         with tempfile.TemporaryDirectory() as pasta:
             pasta_cache = os.path.join(pasta, "cache")
             os.makedirs(pasta_cache)
@@ -488,7 +483,7 @@ class TestPexelsCacheFiles(unittest.TestCase):
             provider._metadata = {
                 "expirado": {
                     "caminho": expirado,
-                    "baixado_em": time.time() - (bot_main.CACHE_TTL_HOURS + 1) * 3600,
+                    "baixado_em": time.time() - (media_service.CACHE_TTL_HOURS + 1) * 3600,
                 },
                 "externo": {"caminho": externo, "baixado_em": time.time()},
             }
@@ -511,7 +506,7 @@ class TestFallbackPexelsParaLocal(unittest.TestCase):
         item_local = _media_item("assets/videos/local1.mp4")
         fallback = FakeMediaProvider(itens=[item_local])
 
-        manager = bot_main.MediaManager(
+        manager = media_service.MediaManager(
             provider=primario, provider_fallback=fallback, arquivo_historico="/tmp/hist_teste_1.json"
         )
         with mock.patch("builtins.print"):
@@ -521,7 +516,7 @@ class TestFallbackPexelsParaLocal(unittest.TestCase):
 
     def test_sem_fallback_propaga_erro(self):
         primario = FakeMediaProvider(falha_listar=RuntimeError("Pexels indisponível"))
-        manager = bot_main.MediaManager(
+        manager = media_service.MediaManager(
             provider=primario, provider_fallback=None, arquivo_historico="/tmp/hist_teste_2.json"
         )
         with self.assertRaises(RuntimeError):
@@ -532,10 +527,10 @@ class TestFallbackPexelsParaLocal(unittest.TestCase):
 # 4-6. escolher_videos() com pools de tamanhos diferentes
 # ===========================================================================
 class TestEscolherVideosPool(unittest.TestCase):
-    def _manager_com_pool(self, quantidade_itens: int, arquivo_historico: str) -> "bot_main.MediaManager":
+    def _manager_com_pool(self, quantidade_itens: int, arquivo_historico: str) -> "services.media_service.MediaManager":
         itens = [_media_item(f"video{i}.mp4") for i in range(quantidade_itens)]
         provider = FakeMediaProvider(itens=itens)
-        return bot_main.MediaManager(provider=provider, provider_fallback=None, arquivo_historico=arquivo_historico)
+        return media_service.MediaManager(provider=provider, provider_fallback=None, arquivo_historico=arquivo_historico)
 
     def test_apenas_1_video_valido_reaproveita_sem_travar(self):
         manager = self._manager_com_pool(1, "/tmp/hist_teste_4.json")
@@ -559,7 +554,7 @@ class TestEscolherVideosPool(unittest.TestCase):
         self.assertEqual(len(set(escolhidos)), 6)  # nenhuma repetição quando não é necessário
 
     def test_nenhum_video_disponivel_levanta_erro(self):
-        manager = bot_main.MediaManager(
+        manager = media_service.MediaManager(
             provider=FakeMediaProvider(itens=[]), provider_fallback=None, arquivo_historico="/tmp/hist_teste_7.json"
         )
         with self.assertRaises(RuntimeError):
@@ -579,14 +574,14 @@ class TestPrepararClipDeFundo(unittest.TestCase):
             duracao_total = sum(c.duration for c in clips)
             return FakeClip(duration=duracao_total, size=(1920, 1080))
 
-        with mock.patch("bot_main.VideoFileClip", return_value=clip_curto), mock.patch(
-            "bot_main.concatenate_videoclips", side_effect=fake_concatenate
-        ), mock.patch("bot_main.os.path.exists", return_value=True), mock.patch(
-            "bot_main._verificar_fundo_saudavel"
+        with mock.patch("services.video_service.VideoFileClip", return_value=clip_curto), mock.patch(
+            "services.video_service.concatenate_videoclips", side_effect=fake_concatenate
+        ), mock.patch("services.video_service.os.path.exists", return_value=True), mock.patch(
+            "services.video_service._verificar_fundo_saudavel"
         ), mock.patch(
-            "bot_main._redimensionar_para_vertical", side_effect=lambda c: c
+            "services.video_service._redimensionar_para_vertical", side_effect=lambda c: c
         ):
-            resultado = bot_main._preparar_clip_de_fundo("curto.mp4", duracao_alvo=10.0, clips_para_fechar=[])
+            resultado = video_service._preparar_clip_de_fundo("curto.mp4", duracao_alvo=10.0, clips_para_fechar=[])
 
         self.assertTrue(chamadas_concat, "esperava que o loop (concatenate_videoclips) fosse acionado")
         self.assertGreaterEqual(chamadas_concat[0], 4)  # ceil(10/3) == 4 cópias
@@ -595,14 +590,14 @@ class TestPrepararClipDeFundo(unittest.TestCase):
     def test_video_maior_que_duracao_da_narracao_corta_sem_loop(self):
         clip_longo = FakeClip(duration=30.0, size=(1920, 1080))
 
-        with mock.patch("bot_main.VideoFileClip", return_value=clip_longo), mock.patch(
-            "bot_main.concatenate_videoclips"
-        ) as mock_concat, mock.patch("bot_main.os.path.exists", return_value=True), mock.patch(
-            "bot_main._verificar_fundo_saudavel"
+        with mock.patch("services.video_service.VideoFileClip", return_value=clip_longo), mock.patch(
+            "services.video_service.concatenate_videoclips"
+        ) as mock_concat, mock.patch("services.video_service.os.path.exists", return_value=True), mock.patch(
+            "services.video_service._verificar_fundo_saudavel"
         ), mock.patch(
-            "bot_main._redimensionar_para_vertical", side_effect=lambda c: c
+            "services.video_service._redimensionar_para_vertical", side_effect=lambda c: c
         ):
-            resultado = bot_main._preparar_clip_de_fundo("longo.mp4", duracao_alvo=6.0, clips_para_fechar=[])
+            resultado = video_service._preparar_clip_de_fundo("longo.mp4", duracao_alvo=6.0, clips_para_fechar=[])
 
         mock_concat.assert_not_called()  # não precisa de loop
         # Fase 2 (item 12): com folga grande (30s de origem para 6s de
@@ -616,9 +611,9 @@ class TestPrepararClipDeFundo(unittest.TestCase):
         self.assertAlmostEqual(resultado.duration, 6.0)
 
     def test_arquivo_inexistente_levanta_fundo_invalido(self):
-        with mock.patch("bot_main.os.path.exists", return_value=False):
-            with self.assertRaises(bot_main.FundoInvalidoError):
-                bot_main._preparar_clip_de_fundo("nao_existe.mp4", duracao_alvo=5.0, clips_para_fechar=[])
+        with mock.patch("services.video_service.os.path.exists", return_value=False):
+            with self.assertRaises(FundoInvalidoError):
+                video_service._preparar_clip_de_fundo("nao_existe.mp4", duracao_alvo=5.0, clips_para_fechar=[])
 
 
 # ===========================================================================
@@ -630,25 +625,25 @@ class TestEscolherPontoDeCorteTemporal(unittest.TestCase):
         # 6.5s de origem para 6.0s de alvo = 0.5s de folga, abaixo do
         # mínimo (BROLL_FOLGA_MINIMA_PARA_VARIAR_INICIO=1.0s) — mantém o
         # comportamento antigo (sempre começa em 0).
-        ponto = bot_main._escolher_ponto_de_corte_temporal(duracao_origem=6.5, duracao_alvo=6.0)
+        ponto = video_service._escolher_ponto_de_corte_temporal(duracao_origem=6.5, duracao_alvo=6.0)
         self.assertEqual(ponto, 0.0)
 
     def test_folga_grande_varia_dentro_dos_limites_seguros(self):
         random.seed(42)
         for _ in range(50):
-            ponto = bot_main._escolher_ponto_de_corte_temporal(duracao_origem=60.0, duracao_alvo=6.0)
+            ponto = video_service._escolher_ponto_de_corte_temporal(duracao_origem=60.0, duracao_alvo=6.0)
             self.assertGreaterEqual(ponto, 0.0)
             self.assertLessEqual(ponto + 6.0, 60.0)
 
     def test_folga_grande_produz_pontos_iniciais_diferentes_entre_chamadas(self):
         random.seed(7)
-        pontos = {bot_main._escolher_ponto_de_corte_temporal(60.0, 6.0) for _ in range(20)}
+        pontos = {video_service._escolher_ponto_de_corte_temporal(60.0, 6.0) for _ in range(20)}
         self.assertGreater(len(pontos), 1)  # não é sempre o mesmo valor fixo
 
     def test_nunca_ultrapassa_duracao_de_origem(self):
         random.seed(1)
         for _ in range(50):
-            ponto = bot_main._escolher_ponto_de_corte_temporal(duracao_origem=8.0, duracao_alvo=6.0)
+            ponto = video_service._escolher_ponto_de_corte_temporal(duracao_origem=8.0, duracao_alvo=6.0)
             self.assertLessEqual(ponto + 6.0, 8.0 + 1e-9)
 
 
@@ -657,8 +652,8 @@ class TestEscolherPontoDeCorteTemporal(unittest.TestCase):
 # ===========================================================================
 class TestGeometriaVertical(unittest.TestCase):
     def test_constantes_produzem_1080x1920(self):
-        altura_esperada = round(bot_main.VIDEO_WIDTH / bot_main.ASPECT_RATIO)
-        self.assertEqual(bot_main.VIDEO_WIDTH, 1080)
+        altura_esperada = round(video_service.VIDEO_WIDTH / video_service.ASPECT_RATIO)
+        self.assertEqual(video_service.VIDEO_WIDTH, 1080)
         self.assertEqual(altura_esperada, 1920)
 
 
@@ -670,39 +665,39 @@ class TestSafeZoneLegendas(unittest.TestCase):
         # Não deixa a legenda colada na borda (perto de 0) nem ocupando a
         # tela quase inteira (perto de 1) — faixa larga o suficiente para
         # não travar em ajustes finos futuros, mas pega regressões grandes.
-        self.assertGreater(bot_main.SAFE_AREA_BOTTOM, 0.10)
-        self.assertLess(bot_main.SAFE_AREA_BOTTOM, 0.35)
+        self.assertGreater(video_service.SAFE_AREA_BOTTOM, 0.10)
+        self.assertLess(video_service.SAFE_AREA_BOTTOM, 0.35)
 
     def test_legend_width_fraction_deixa_margem_lateral(self):
-        self.assertLess(bot_main.LEGEND_WIDTH_FRACTION, 0.95)
+        self.assertLess(video_service.LEGEND_WIDTH_FRACTION, 0.95)
 
     def test_safe_area_top_dentro_de_faixa_razoavel(self):
-        self.assertGreater(bot_main.SAFE_AREA_TOP, 0.0)
-        self.assertLess(bot_main.SAFE_AREA_TOP, 0.25)
+        self.assertGreater(video_service.SAFE_AREA_TOP, 0.0)
+        self.assertLess(video_service.SAFE_AREA_TOP, 0.25)
 
     def test_safe_area_side_dentro_de_faixa_razoavel(self):
-        self.assertGreater(bot_main.SAFE_AREA_SIDE, 0.0)
-        self.assertLess(bot_main.SAFE_AREA_SIDE, 0.20)
+        self.assertGreater(video_service.SAFE_AREA_SIDE, 0.0)
+        self.assertLess(video_service.SAFE_AREA_SIDE, 0.20)
 
     def test_safe_areas_top_e_bottom_nao_ultrapassam_a_tela(self):
         # Topo + base não podem, juntos, consumir a tela inteira (senão
         # não sobraria nenhuma área útil para o texto).
-        self.assertLess(bot_main.SAFE_AREA_TOP + bot_main.SAFE_AREA_BOTTOM, 1.0)
+        self.assertLess(video_service.SAFE_AREA_TOP + video_service.SAFE_AREA_BOTTOM, 1.0)
 
     def test_legend_width_fraction_respeita_safe_area_lateral(self):
         # A largura máxima de legenda precisa caber dentro do que sobra
         # depois de reservar SAFE_AREA_SIDE dos dois lados (item 4: nenhuma
         # margem "solta" além das constantes centralizadas).
-        largura_disponivel = 1.0 - 2 * bot_main.SAFE_AREA_SIDE
-        self.assertLessEqual(bot_main.LEGEND_WIDTH_FRACTION, largura_disponivel)
+        largura_disponivel = 1.0 - 2 * video_service.SAFE_AREA_SIDE
+        self.assertLessEqual(video_service.LEGEND_WIDTH_FRACTION, largura_disponivel)
 
     def test_clamp_y_legenda_nao_ultrapassa_safe_area_top(self):
         # Reproduz o clamp aplicado em `_construir_clip_grupo()`: um grupo
         # de legenda alto o bastante para, sem o clamp, ficar acima da
         # safe area do topo precisa ser empurrado de volta para dentro
         # dela.
-        altura_video = bot_main.VIDEO_HEIGHT
-        y_minimo = int(altura_video * bot_main.SAFE_AREA_TOP)
+        altura_video = video_service.VIDEO_HEIGHT
+        y_minimo = int(altura_video * video_service.SAFE_AREA_TOP)
         y_calculado_sem_clamp = -50  # simula um grupo de 3 linhas bem alto
         y_video = max(y_minimo, y_calculado_sem_clamp)
         self.assertGreaterEqual(y_video, y_minimo)
@@ -714,38 +709,38 @@ class TestSafeZoneLegendas(unittest.TestCase):
 class TestAnimacaoEntradaSaidaLegenda(unittest.TestCase):
     def test_meio_do_grupo_fica_em_escala_e_opacidade_totais(self):
         duracao = 2.0
-        escala, opacidade = bot_main._fator_entrada_saida_grupo(1.0, duracao, eh_hook=False)
+        escala, opacidade = video_service._fator_entrada_saida_grupo(1.0, duracao, eh_hook=False)
         self.assertEqual(escala, 1.0)
         self.assertEqual(opacidade, 1.0)
 
     def test_inicio_do_grupo_comeca_com_escala_e_opacidade_reduzidas(self):
-        escala, opacidade = bot_main._fator_entrada_saida_grupo(0.0, 2.0, eh_hook=False)
-        self.assertAlmostEqual(escala, bot_main.LEGEND_ANIM_SCALE_START, places=3)
+        escala, opacidade = video_service._fator_entrada_saida_grupo(0.0, 2.0, eh_hook=False)
+        self.assertAlmostEqual(escala, video_service.LEGEND_ANIM_SCALE_START, places=3)
         self.assertAlmostEqual(opacidade, 0.0, places=3)
 
     def test_entrada_termina_em_escala_e_opacidade_totais(self):
-        escala, opacidade = bot_main._fator_entrada_saida_grupo(
-            bot_main.LEGEND_ANIM_IN_DURATION, 2.0, eh_hook=False
+        escala, opacidade = video_service._fator_entrada_saida_grupo(
+            video_service.LEGEND_ANIM_IN_DURATION, 2.0, eh_hook=False
         )
         self.assertAlmostEqual(escala, 1.0, places=2)
         self.assertAlmostEqual(opacidade, 1.0, places=2)
 
     def test_saida_do_grupo_reduz_opacidade_mas_nao_a_escala(self):
         duracao = 2.0
-        t = duracao - bot_main.LEGEND_ANIM_OUT_DURATION / 2
-        escala, opacidade = bot_main._fator_entrada_saida_grupo(t, duracao, eh_hook=False)
+        t = duracao - video_service.LEGEND_ANIM_OUT_DURATION / 2
+        escala, opacidade = video_service._fator_entrada_saida_grupo(t, duracao, eh_hook=False)
         self.assertEqual(escala, 1.0)  # saída nunca encolhe, só esmaece
         self.assertLess(opacidade, 1.0)
 
     def test_hook_usa_escala_inicial_mais_forte_que_o_padrao(self):
-        escala_normal, _ = bot_main._fator_entrada_saida_grupo(0.0, 2.0, eh_hook=False)
-        escala_hook, _ = bot_main._fator_entrada_saida_grupo(0.0, 2.0, eh_hook=True)
+        escala_normal, _ = video_service._fator_entrada_saida_grupo(0.0, 2.0, eh_hook=False)
+        escala_hook, _ = video_service._fator_entrada_saida_grupo(0.0, 2.0, eh_hook=True)
         self.assertLess(escala_hook, escala_normal)
-        self.assertEqual(escala_hook, bot_main.HOOK_ANIM_SCALE_START)
+        self.assertEqual(escala_hook, video_service.HOOK_ANIM_SCALE_START)
 
     def test_escala_e_opacidade_sempre_no_intervalo_valido(self):
         for t in [0.0, 0.05, 0.16, 0.5, 1.0, 1.85, 1.9, 2.0]:
-            escala, opacidade = bot_main._fator_entrada_saida_grupo(t, 2.0, eh_hook=False)
+            escala, opacidade = video_service._fator_entrada_saida_grupo(t, 2.0, eh_hook=False)
             self.assertGreaterEqual(escala, 0.0)
             self.assertLessEqual(escala, 1.0001)
             self.assertGreaterEqual(opacidade, 0.0)
@@ -757,25 +752,25 @@ class TestAnimacaoEntradaSaidaLegenda(unittest.TestCase):
 # ===========================================================================
 class TestHookZoomPunch(unittest.TestCase):
     def test_punch_e_zero_quando_nao_e_hook(self):
-        self.assertEqual(bot_main._progresso_punch_hook(0.0, eh_hook=False), 0.0)
-        self.assertEqual(bot_main._progresso_punch_hook(0.1, eh_hook=False), 0.0)
+        self.assertEqual(video_service._progresso_punch_hook(0.0, eh_hook=False), 0.0)
+        self.assertEqual(video_service._progresso_punch_hook(0.1, eh_hook=False), 0.0)
 
     def test_punch_e_maximo_no_inicio_do_hook(self):
-        punch = bot_main._progresso_punch_hook(0.0, eh_hook=True)
-        self.assertAlmostEqual(punch, bot_main.HOOK_ZOOM_PUNCH - 1.0, places=3)
+        punch = video_service._progresso_punch_hook(0.0, eh_hook=True)
+        self.assertAlmostEqual(punch, video_service.HOOK_ZOOM_PUNCH - 1.0, places=3)
 
     def test_punch_decai_ate_zero_ao_final_da_janela(self):
-        punch = bot_main._progresso_punch_hook(bot_main.HOOK_ZOOM_PUNCH_DURATION, eh_hook=True)
+        punch = video_service._progresso_punch_hook(video_service.HOOK_ZOOM_PUNCH_DURATION, eh_hook=True)
         self.assertEqual(punch, 0.0)
 
     def test_punch_e_sempre_decrescente_dentro_da_janela(self):
         amostras = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5]
-        valores = [bot_main._progresso_punch_hook(t, eh_hook=True) for t in amostras]
+        valores = [video_service._progresso_punch_hook(t, eh_hook=True) for t in amostras]
         for anterior, atual in zip(valores, valores[1:]):
             self.assertLessEqual(atual, anterior)
 
     def test_punch_e_zero_depois_da_janela_do_hook(self):
-        punch = bot_main._progresso_punch_hook(bot_main.HOOK_ZOOM_PUNCH_DURATION + 1.0, eh_hook=True)
+        punch = video_service._progresso_punch_hook(video_service.HOOK_ZOOM_PUNCH_DURATION + 1.0, eh_hook=True)
         self.assertEqual(punch, 0.0)
 
     def test_apenas_o_primeiro_trecho_de_broll_recebe_o_hook(self):
@@ -793,7 +788,7 @@ class TestHistoricoRespeitaDescarte(unittest.TestCase):
     def test_descartar_nao_confirma_uso(self):
         item = _media_item("video_ruim.mp4")
         provider = FakeMediaProvider(itens=[item])
-        manager = bot_main.MediaManager(
+        manager = media_service.MediaManager(
             provider=provider, provider_fallback=None, arquivo_historico="/tmp/hist_teste_11.json"
         )
         with mock.patch("builtins.print"):
@@ -807,12 +802,12 @@ class TestHistoricoRespeitaDescarte(unittest.TestCase):
     def test_confirmar_uso_registra_no_historico(self):
         item = _media_item("video_bom.mp4")
         provider = FakeMediaProvider(itens=[item])
-        manager = bot_main.MediaManager(
+        manager = media_service.MediaManager(
             provider=provider, provider_fallback=None, arquivo_historico="/tmp/hist_teste_12.json"
         )
         with mock.patch("builtins.print"):
             caminho = manager.escolher_video(contexto="x")
-        with mock.patch.object(bot_main.MediaManager, "_salvar_historico"):
+        with mock.patch.object(media_service.MediaManager, "_salvar_historico"):
             manager.confirmar_uso(caminho)
 
         self.assertIn(caminho, manager._historico)
@@ -825,7 +820,7 @@ class TestRetryNaoRepeteImediatamente(unittest.TestCase):
     def test_escolher_videos_prioriza_ineditos_antes_de_repetir(self):
         itens = [_media_item(f"video{i}.mp4") for i in range(3)]
         provider = FakeMediaProvider(itens=itens)
-        manager = bot_main.MediaManager(
+        manager = media_service.MediaManager(
             provider=provider, provider_fallback=None, arquivo_historico="/tmp/hist_teste_13.json"
         )
         with mock.patch("builtins.print"):
@@ -837,7 +832,7 @@ class TestRetryNaoRepeteImediatamente(unittest.TestCase):
 
     def test_definir_segmentos_broll_nao_corta_no_meio_de_legenda(self):
         pontos_de_corte = [0.0, 5.0, 11.0, 18.0, 25.0]
-        segmentos = bot_main._definir_segmentos_broll(pontos_de_corte, duracao_total=30.0)
+        segmentos = video_service._definir_segmentos_broll(pontos_de_corte, duracao_total=30.0)
 
         # Invariante real: todo LIMITE de segmento tem que ser um dos
         # pontos de corte originais (ou 0/duração total) — nunca um corte
@@ -858,11 +853,11 @@ class TestRetryNaoRepeteImediatamente(unittest.TestCase):
 
     def test_definir_segmentos_broll_respeita_teto_maximo(self):
         pontos_de_corte = [float(i) for i in range(0, 40, 2)]  # muitos pontos, 2 em 2 segundos
-        segmentos = bot_main._definir_segmentos_broll(pontos_de_corte, duracao_total=40.0)
-        self.assertLessEqual(len(segmentos), bot_main.BROLL_MAX_SEGMENTOS)
+        segmentos = video_service._definir_segmentos_broll(pontos_de_corte, duracao_total=40.0)
+        self.assertLessEqual(len(segmentos), video_service.BROLL_MAX_SEGMENTOS)
 
     def test_definir_segmentos_broll_video_curto_gera_1_segmento(self):
-        segmentos = bot_main._definir_segmentos_broll([], duracao_total=4.0)
+        segmentos = video_service._definir_segmentos_broll([], duracao_total=4.0)
         self.assertEqual(segmentos, [(0.0, 4.0)])
 
 
@@ -878,8 +873,8 @@ class TestNormalizeFrameSize(unittest.TestCase):
         frame = np.zeros((1921, 1080, 3), dtype="uint8")
         mascara = np.ones((1918, 1080), dtype="float32")
 
-        frame_norm = bot_main.normalize_frame_size(frame, altura=1920, largura=1080)
-        mascara_norm = bot_main.normalize_frame_size(mascara, altura=1920, largura=1080)
+        frame_norm = video_service.normalize_frame_size(frame, altura=1920, largura=1080)
+        mascara_norm = video_service.normalize_frame_size(mascara, altura=1920, largura=1080)
 
         self.assertEqual(frame_norm.shape, (1920, 1080, 3))
         self.assertEqual(mascara_norm.shape, (1920, 1080))
@@ -892,53 +887,53 @@ class TestNormalizeFrameSize(unittest.TestCase):
         import numpy as np
 
         mascara = np.ones((100, 50), dtype="float32")
-        resultado = bot_main.normalize_frame_size(mascara, altura=90, largura=60)
+        resultado = video_service.normalize_frame_size(mascara, altura=90, largura=60)
         self.assertEqual(resultado.shape, (90, 60))
 
     def test_mascara_h_w_1(self):
         import numpy as np
 
         mascara = np.ones((100, 50, 1), dtype="float32")
-        resultado = bot_main.normalize_frame_size(mascara, altura=90, largura=60)
+        resultado = video_service.normalize_frame_size(mascara, altura=90, largura=60)
         self.assertEqual(resultado.shape, (90, 60, 1))
 
     def test_frame_rgb_h_w_3(self):
         import numpy as np
 
         frame = np.zeros((100, 50, 3), dtype="uint8")
-        resultado = bot_main.normalize_frame_size(frame, altura=110, largura=45)
+        resultado = video_service.normalize_frame_size(frame, altura=110, largura=45)
         self.assertEqual(resultado.shape, (110, 45, 3))
 
     def test_frame_rgba_h_w_4(self):
         import numpy as np
 
         frame = np.zeros((100, 50, 4), dtype="uint8")
-        resultado = bot_main.normalize_frame_size(frame, altura=95, largura=55)
+        resultado = video_service.normalize_frame_size(frame, altura=95, largura=55)
         self.assertEqual(resultado.shape, (95, 55, 4))
 
     def test_dimensoes_impares(self):
         import numpy as np
 
         frame = np.zeros((101, 51, 3), dtype="uint8")
-        resultado = bot_main.normalize_frame_size(frame, altura=100, largura=50)
+        resultado = video_service.normalize_frame_size(frame, altura=100, largura=50)
         self.assertEqual(resultado.shape, (100, 50, 3))
 
         frame_menor = np.zeros((99, 49, 3), dtype="uint8")
-        resultado_menor = bot_main.normalize_frame_size(frame_menor, altura=100, largura=50)
+        resultado_menor = video_service.normalize_frame_size(frame_menor, altura=100, largura=50)
         self.assertEqual(resultado_menor.shape, (100, 50, 3))
 
     def test_ja_no_tamanho_certo_retorna_sem_alterar_conteudo(self):
         import numpy as np
 
         frame = np.arange(100 * 50 * 3, dtype="uint8").reshape(100, 50, 3)
-        resultado = bot_main.normalize_frame_size(frame, altura=100, largura=50)
+        resultado = video_service.normalize_frame_size(frame, altura=100, largura=50)
         self.assertTrue((resultado == frame).all())
 
     def test_padding_replica_borda_em_vez_de_inventar_preto(self):
         import numpy as np
 
         frame = np.full((10, 10, 3), 200, dtype="uint8")
-        resultado = bot_main.normalize_frame_size(frame, altura=12, largura=10)
+        resultado = video_service.normalize_frame_size(frame, altura=12, largura=10)
         # As linhas adicionadas (padding) replicam a borda (200), nunca
         # viram preto artificial (0) — não é um "broadcast artificial".
         self.assertTrue((resultado[0] == 200).all())
@@ -987,8 +982,8 @@ class FakeVideoClipGeometria:
 
 class TestRedimensionarParaVerticalConsistencia(unittest.TestCase):
     def _tamanho_final(self, largura_original, altura_original):
-        with mock.patch("bot_main._debug_registrar"):
-            resultado = bot_main._redimensionar_para_vertical(
+        with mock.patch("services.video_service._debug_registrar"):
+            resultado = video_service._redimensionar_para_vertical(
                 FakeVideoClipGeometria((largura_original, altura_original))
             )
         return resultado.size
@@ -1009,10 +1004,10 @@ class TestRedimensionarParaVerticalConsistencia(unittest.TestCase):
         for largura, altura in origens:
             with self.subTest(origem=(largura, altura)):
                 tamanho_final = self._tamanho_final(largura, altura)
-                self.assertEqual(tamanho_final, (bot_main.VIDEO_WIDTH, bot_main.VIDEO_HEIGHT))
+                self.assertEqual(tamanho_final, (video_service.VIDEO_WIDTH, video_service.VIDEO_HEIGHT))
 
     def test_altura_alvo_e_1920_para_largura_1080(self):
-        self.assertEqual(bot_main.VIDEO_HEIGHT, 1920)
+        self.assertEqual(video_service.VIDEO_HEIGHT, 1920)
 
 
 # ===========================================================================
@@ -1021,7 +1016,7 @@ class TestRedimensionarParaVerticalConsistencia(unittest.TestCase):
 # ===========================================================================
 class TestPexelsUserAgentECloudflare(unittest.TestCase):
     def setUp(self):
-        self.provider = bot_main.PexelsMediaProvider.__new__(bot_main.PexelsMediaProvider)
+        self.provider = media_service.PexelsMediaProvider.__new__(media_service.PexelsMediaProvider)
         self.provider.api_key = "chave-de-teste-1234567890"
 
     def test_busca_envia_user_agent_de_navegador(self):
@@ -1041,14 +1036,14 @@ class TestPexelsUserAgentECloudflare(unittest.TestCase):
             capturado["headers"] = dict(requisicao.header_items())
             return _RespostaFake()
 
-        with mock.patch("bot_main.urllib.request.urlopen", side_effect=fake_urlopen):
+        with mock.patch("services.media_service.urllib.request.urlopen", side_effect=fake_urlopen):
             self.provider._buscar("saturn rings")
 
         # urllib normaliza o nome do header para "User-agent" (capitalização
         # própria dele) — o que importa é que o valor de navegador chegou.
         headers_lower = {k.lower(): v for k, v in capturado["headers"].items()}
         self.assertIn("user-agent", headers_lower)
-        self.assertEqual(headers_lower["user-agent"], bot_main.PEXELS_USER_AGENT)
+        self.assertEqual(headers_lower["user-agent"], media_service.PEXELS_USER_AGENT)
         self.assertNotIn("python-urllib", headers_lower["user-agent"].lower())
 
     def test_download_envia_user_agent_de_navegador(self):
@@ -1075,13 +1070,13 @@ class TestPexelsUserAgentECloudflare(unittest.TestCase):
             return _RespostaFake()
 
         destino = os.path.join(_diretorio_temporario_para_teste(self), "video.mp4")
-        with mock.patch("bot_main.urllib.request.urlopen", side_effect=fake_urlopen):
+        with mock.patch("services.media_service.urllib.request.urlopen", side_effect=fake_urlopen):
             ok = self.provider._baixar_arquivo("https://player.vimeo.com/x.mp4", destino)
 
         self.assertTrue(ok)
         headers_lower = {k.lower(): v for k, v in capturado["headers"].items()}
         self.assertIn("user-agent", headers_lower)
-        self.assertEqual(headers_lower["user-agent"], bot_main.PEXELS_USER_AGENT)
+        self.assertEqual(headers_lower["user-agent"], media_service.PEXELS_USER_AGENT)
 
     def test_403_com_corpo_1010_gera_mensagem_especifica_de_cloudflare(self):
         corpo = b"error code: 1010"
@@ -1093,7 +1088,7 @@ class TestPexelsUserAgentECloudflare(unittest.TestCase):
             def read(self):
                 return corpo
 
-        with mock.patch("bot_main.urllib.request.urlopen", side_effect=_ErroFake()):
+        with mock.patch("services.media_service.urllib.request.urlopen", side_effect=_ErroFake()):
             with self.assertRaises(RuntimeError) as ctx:
                 self.provider._buscar("saturn rings")
 
@@ -1112,7 +1107,7 @@ class TestPexelsUserAgentECloudflare(unittest.TestCase):
             def read(self):
                 return corpo
 
-        with mock.patch("bot_main.urllib.request.urlopen", side_effect=_ErroFake()):
+        with mock.patch("services.media_service.urllib.request.urlopen", side_effect=_ErroFake()):
             with self.assertRaises(RuntimeError) as ctx:
                 self.provider._buscar("saturn rings")
 
@@ -1129,65 +1124,11 @@ def _diretorio_temporario_para_teste(testcase: unittest.TestCase) -> str:
 
 
 # ===========================================================================
-# 16. TTS: OpenAI 429 insufficient_quota -> Google TTS (sem gastar retries
-#     do OpenAI num erro que não é timeout) — Problema 6 da auditoria
-#     (comportamento já correto; teste de regressão para não quebrar)
-# ===========================================================================
-class TestFallbackTTS(unittest.TestCase):
-    def test_quota_insuficiente_na_openai_passa_direto_para_google_sem_repetir(self):
-        chamadas = {"openai": 0, "google": 0}
-
-        def fake_openai(texto, caminho_saida):
-            chamadas["openai"] += 1
-            raise RuntimeError("Error code: 429 - insufficient_quota")
-
-        def fake_google(texto, caminho_saida):
-            chamadas["google"] += 1
-            return caminho_saida
-
-        with mock.patch(
-            "bot_main._provedores_tts_configurados",
-            return_value=[("OpenAI TTS", fake_openai), ("Google Cloud TTS", fake_google)],
-        ), mock.patch("bot_main.preparar_texto_para_narracao", side_effect=lambda t: t):
-            resultado = bot_main.gerar_audio("um roteiro de teste qualquer.", "saida.mp3")
-
-        self.assertEqual(resultado, "saida.mp3")
-        # 429/insufficient_quota não é timeout: só 1 tentativa na OpenAI,
-        # nunca as 2 permitidas por TTS_TENTATIVAS_POR_PROVEDOR — se
-        # alguém "consertar" isso adicionando retry pra todo erro, este
-        # teste falha.
-        self.assertEqual(chamadas["openai"], 1)
-        self.assertEqual(chamadas["google"], 1)
-
-    def test_timeout_na_openai_tenta_de_novo_antes_de_cair_para_google(self):
-        chamadas = {"openai": 0, "google": 0}
-
-        def fake_openai(texto, caminho_saida):
-            chamadas["openai"] += 1
-            raise TimeoutError("request timed out")
-
-        def fake_google(texto, caminho_saida):
-            chamadas["google"] += 1
-            return caminho_saida
-
-        with mock.patch(
-            "bot_main._provedores_tts_configurados",
-            return_value=[("OpenAI TTS", fake_openai), ("Google Cloud TTS", fake_google)],
-        ), mock.patch("bot_main.preparar_texto_para_narracao", side_effect=lambda t: t), mock.patch(
-            "bot_main.time.sleep"
-        ):
-            bot_main.gerar_audio("um roteiro de teste qualquer.", "saida.mp3")
-
-        self.assertEqual(chamadas["openai"], bot_main.TTS_TENTATIVAS_POR_PROVEDOR)
-        self.assertEqual(chamadas["google"], 1)
-
-
-# ===========================================================================
 # 17. _texto_do_segmento() — reconstrói o texto narrado em cada trecho a
 #     partir das PalavraLegenda (Fase 2, item 2/3)
 # ===========================================================================
-def _palavra(texto: str, start: float, end: float, index: int) -> "bot_main.PalavraLegenda":
-    return bot_main.PalavraLegenda(palavra=texto, start=start, end=end, duration=end - start, index=index)
+def _palavra(texto: str, start: float, end: float, index: int) -> "services.video_service.PalavraLegenda":
+    return video_service.PalavraLegenda(palavra=texto, start=start, end=end, duration=end - start, index=index)
 
 
 class TestTextoDoSegmento(unittest.TestCase):
@@ -1198,12 +1139,12 @@ class TestTextoDoSegmento(unittest.TestCase):
             _palavra("aneis", 0.8, 1.3, 2),
             _palavra("enormes", 6.0, 6.5, 3),  # já no PRÓXIMO trecho
         ]
-        texto = bot_main._texto_do_segmento((0.0, 6.0), palavras)
+        texto = video_service._texto_do_segmento((0.0, 6.0), palavras)
         self.assertEqual(texto, "Saturno tem aneis")
 
     def test_intervalo_sem_palavras_retorna_string_vazia(self):
         palavras = [_palavra("Saturno", 10.0, 10.5, 0)]
-        texto = bot_main._texto_do_segmento((0.0, 6.0), palavras)
+        texto = video_service._texto_do_segmento((0.0, 6.0), palavras)
         self.assertEqual(texto, "")
 
     def test_usa_o_inicio_da_palavra_como_criterio_de_pertencimento(self):
@@ -1211,7 +1152,7 @@ class TestTextoDoSegmento(unittest.TestCase):
         # termine depois do limite (`fim` do trecho) — mesmo critério de
         # `_definir_segmentos_broll()`.
         palavras = [_palavra("particulas", 5.8, 6.4, 0)]
-        texto = bot_main._texto_do_segmento((0.0, 6.0), palavras)
+        texto = video_service._texto_do_segmento((0.0, 6.0), palavras)
         self.assertEqual(texto, "particulas")
 
 
@@ -1234,30 +1175,30 @@ class TestPontuarCandidatoBroll(unittest.TestCase):
         video = self._video()
         candidato_a = self._arquivo(width=1280)
         candidato_b = self._arquivo(width=1920)
-        score_a = bot_main._pontuar_candidato_broll(video, candidato_a, 0, 4, duracao_alvo=6.0)
-        score_b = bot_main._pontuar_candidato_broll(video, candidato_b, 0, 4, duracao_alvo=6.0)
+        score_a = media_service._pontuar_candidato_broll(video, candidato_a, 0, 4, duracao_alvo=6.0)
+        score_b = media_service._pontuar_candidato_broll(video, candidato_b, 0, 4, duracao_alvo=6.0)
         self.assertGreater(score_b, score_a)
 
     def test_vertical_pontua_mais_que_horizontal(self):
         arquivo = self._arquivo()
         video_vertical = self._video(width=1080, height=1920)
         video_horizontal = self._video(width=1920, height=1080)
-        score_vertical = bot_main._pontuar_candidato_broll(video_vertical, arquivo, 0, 4, duracao_alvo=6.0)
-        score_horizontal = bot_main._pontuar_candidato_broll(video_horizontal, arquivo, 0, 4, duracao_alvo=6.0)
+        score_vertical = media_service._pontuar_candidato_broll(video_vertical, arquivo, 0, 4, duracao_alvo=6.0)
+        score_horizontal = media_service._pontuar_candidato_broll(video_horizontal, arquivo, 0, 4, duracao_alvo=6.0)
         self.assertGreater(score_vertical, score_horizontal)
 
     def test_query_mais_relevante_pontua_mais_que_a_ultima_da_cascata(self):
         video = self._video()
         arquivo = self._arquivo()
-        score_primeira_query = bot_main._pontuar_candidato_broll(video, arquivo, 0, 4, duracao_alvo=6.0)
-        score_ultima_query = bot_main._pontuar_candidato_broll(video, arquivo, 3, 4, duracao_alvo=6.0)
+        score_primeira_query = media_service._pontuar_candidato_broll(video, arquivo, 0, 4, duracao_alvo=6.0)
+        score_ultima_query = media_service._pontuar_candidato_broll(video, arquivo, 3, 4, duracao_alvo=6.0)
         self.assertGreater(score_primeira_query, score_ultima_query)
 
     def test_video_ja_usado_pontua_menos_mas_nao_zera(self):
         video = self._video(id=42)
         arquivo = self._arquivo()
-        score_inedito = bot_main._pontuar_candidato_broll(video, arquivo, 0, 4, duracao_alvo=6.0, ja_usados=set())
-        score_repetido = bot_main._pontuar_candidato_broll(
+        score_inedito = media_service._pontuar_candidato_broll(video, arquivo, 0, 4, duracao_alvo=6.0, ja_usados=set())
+        score_repetido = media_service._pontuar_candidato_broll(
             video, arquivo, 0, 4, duracao_alvo=6.0, ja_usados={"42"}
         )
         self.assertGreater(score_inedito, score_repetido)
@@ -1268,8 +1209,8 @@ class TestPontuarCandidatoBroll(unittest.TestCase):
         arquivo = self._arquivo()
         video_no_limite = self._video(duration=6.0)  # exatamente a duração do trecho
         video_com_folga = self._video(duration=14.0)  # ~2.3x a duração do trecho
-        score_no_limite = bot_main._pontuar_candidato_broll(video_no_limite, arquivo, 0, 4, duracao_alvo=6.0)
-        score_com_folga = bot_main._pontuar_candidato_broll(video_com_folga, arquivo, 0, 4, duracao_alvo=6.0)
+        score_no_limite = media_service._pontuar_candidato_broll(video_no_limite, arquivo, 0, 4, duracao_alvo=6.0)
+        score_com_folga = media_service._pontuar_candidato_broll(video_com_folga, arquivo, 0, 4, duracao_alvo=6.0)
         self.assertGreater(score_com_folga, score_no_limite)
 
     def test_path_do_video_usado_aplica_penalidade_ao_id_pexels_correspondente(self):
@@ -1281,7 +1222,7 @@ class TestPontuarCandidatoBroll(unittest.TestCase):
                 {"width": 1920, "height": 1080, "fps": 30, "link": f"https://cdn/{video['id']}.mp4"}
             ]
 
-        provider = bot_main.PexelsMediaProvider.__new__(bot_main.PexelsMediaProvider)
+        provider = media_service.PexelsMediaProvider.__new__(media_service.PexelsMediaProvider)
         provider.api_key = "chave-de-teste"
         provider.cache_dir = "/tmp/cache_teste_score_path"
         provider.metadata_path = "/tmp/cache_teste_score_path/metadata.json"
@@ -1322,13 +1263,13 @@ class TestLegendaAtiva(unittest.TestCase):
             def close(self):
                 self.fechado = True
 
-        bot_main._resetar_cache_legendas()
-        with mock.patch.object(bot_main, "TextClip", FakeTextClip):
-            rgb, alpha = bot_main._obter_tile_palavra("teste", "ativa")
+        video_service._resetar_cache_legendas()
+        with mock.patch.object(video_service, "TextClip", FakeTextClip):
+            rgb, alpha = video_service._obter_tile_palavra("teste", "ativa")
 
-        self.assertEqual(rgb.shape[:2], (8 + bot_main.LEGEND_SHADOW_OFFSET[1], 8 + bot_main.LEGEND_SHADOW_OFFSET[0]))
-        self.assertTrue(np.any(alpha[:, -bot_main.LEGEND_SHADOW_OFFSET[0]:] > 0))
-        self.assertTrue(np.all(rgb[:, -bot_main.LEGEND_SHADOW_OFFSET[0]:] == 0))
+        self.assertEqual(rgb.shape[:2], (8 + video_service.LEGEND_SHADOW_OFFSET[1], 8 + video_service.LEGEND_SHADOW_OFFSET[0]))
+        self.assertTrue(np.any(alpha[:, -video_service.LEGEND_SHADOW_OFFSET[0]:] > 0))
+        self.assertTrue(np.all(rgb[:, -video_service.LEGEND_SHADOW_OFFSET[0]:] == 0))
 
 
 # ===========================================================================
@@ -1337,7 +1278,7 @@ class TestLegendaAtiva(unittest.TestCase):
 # ===========================================================================
 class TestBuscarComFallbackDeQueries(unittest.TestCase):
     def setUp(self):
-        self.provider = bot_main.PexelsMediaProvider.__new__(bot_main.PexelsMediaProvider)
+        self.provider = media_service.PexelsMediaProvider.__new__(media_service.PexelsMediaProvider)
         self.provider.api_key = "chave-de-teste"
         self.provider.cache_dir = "/tmp/cache_teste_fase2"
         self.provider.metadata_path = "/tmp/cache_teste_fase2/metadata.json"
@@ -1396,7 +1337,7 @@ class TestBuscarComFallbackDeQueries(unittest.TestCase):
         def fake_buscar(query):
             chamadas.append(query)
             # cada query já devolve BROLL_CANDIDATOS_POR_TRECHO_ALVO vídeos distintos
-            return [self._video(v) for v in range(100, 100 + bot_main.BROLL_CANDIDATOS_POR_TRECHO_ALVO)]
+            return [self._video(v) for v in range(100, 100 + media_service.BROLL_CANDIDATOS_POR_TRECHO_ALVO)]
 
         with mock.patch.object(self.provider, "_buscar", side_effect=fake_buscar), mock.patch.object(
             self.provider, "_baixar_arquivo", return_value=True
@@ -1410,8 +1351,8 @@ class TestBuscarComFallbackDeQueries(unittest.TestCase):
         self.assertEqual(chamadas, ["q1"])
 
     def test_respeita_teto_de_downloads_da_execucao(self):
-        bot_main.PEXELS_MAX_DOWNLOADS
-        self.provider._downloads_nesta_execucao = bot_main.PEXELS_MAX_DOWNLOADS  # já no teto
+        media_service.PEXELS_MAX_DOWNLOADS
+        self.provider._downloads_nesta_execucao = media_service.PEXELS_MAX_DOWNLOADS  # já no teto
 
         with mock.patch.object(self.provider, "_buscar", return_value=[self._video(1)]), mock.patch.object(
             self.provider, "_baixar_arquivo", return_value=True
@@ -1441,7 +1382,7 @@ class TestBuscarComFallbackDeQueries(unittest.TestCase):
 # 20. MediaManager.escolher_video_contextual() — nunca lança exceção,
 #     cai para o fallback, respeita diversidade (Fase 2, itens 10/21)
 # ===========================================================================
-class FakeMediaProviderContextual(bot_main.MediaProvider):
+class FakeMediaProviderContextual(media_service.MediaProvider):
     """Fake que sabe responder de forma diferente conforme o texto — usado
     para testar que `escolher_video_contextual` realmente repassa o texto
     do trecho ao provider, e não apenas ignora (como o `FakeMediaProvider`
@@ -1468,10 +1409,10 @@ class FakeMediaProviderContextual(bot_main.MediaProvider):
 
 class TestEscolherVideoContextual(unittest.TestCase):
     def test_relevancia_contextual_prevalece_sobre_historico(self):
-        melhor = bot_main.MediaItem("melhor.mp4", "pexels", "video", pontuacao=90.0)
-        pior = bot_main.MediaItem("pior.mp4", "pexels", "video", pontuacao=50.0)
+        melhor = media_service.MediaItem("melhor.mp4", "pexels", "video", pontuacao=90.0)
+        pior = media_service.MediaItem("pior.mp4", "pexels", "video", pontuacao=50.0)
         provider = FakeMediaProviderContextual(itens_padrao=[pior, melhor])
-        manager = bot_main.MediaManager(
+        manager = media_service.MediaManager(
             provider=provider, provider_fallback=None, arquivo_historico="/tmp/hist_ctx_score.json"
         )
         manager._historico = ["melhor.mp4"]
@@ -1484,7 +1425,7 @@ class TestEscolherVideoContextual(unittest.TestCase):
     def test_repassa_texto_e_duracao_ao_provider(self):
         item = _media_item("saturno.mp4")
         provider = FakeMediaProviderContextual(resposta_por_texto={"saturno tem aneis": [item]})
-        manager = bot_main.MediaManager(
+        manager = media_service.MediaManager(
             provider=provider, provider_fallback=None, arquivo_historico="/tmp/hist_ctx_1.json"
         )
 
@@ -1499,7 +1440,7 @@ class TestEscolherVideoContextual(unittest.TestCase):
         primario = FakeMediaProviderContextual(itens_padrao=[])
         item_local = _media_item("assets/videos/local.mp4")
         fallback = FakeMediaProviderContextual(itens_padrao=[item_local])
-        manager = bot_main.MediaManager(
+        manager = media_service.MediaManager(
             provider=primario, provider_fallback=fallback, arquivo_historico="/tmp/hist_ctx_2.json"
         )
 
@@ -1512,7 +1453,7 @@ class TestEscolherVideoContextual(unittest.TestCase):
         primario = FakeMediaProviderContextual(falha=RuntimeError("Pexels fora do ar"))
         item_local = _media_item("assets/videos/local.mp4")
         fallback = FakeMediaProviderContextual(itens_padrao=[item_local])
-        manager = bot_main.MediaManager(
+        manager = media_service.MediaManager(
             provider=primario, provider_fallback=fallback, arquivo_historico="/tmp/hist_ctx_3.json"
         )
 
@@ -1524,7 +1465,7 @@ class TestEscolherVideoContextual(unittest.TestCase):
     def test_nenhum_provider_com_candidato_retorna_none_sem_lancar(self):
         primario = FakeMediaProviderContextual(itens_padrao=[])
         fallback = FakeMediaProviderContextual(itens_padrao=[])
-        manager = bot_main.MediaManager(
+        manager = media_service.MediaManager(
             provider=primario, provider_fallback=fallback, arquivo_historico="/tmp/hist_ctx_4.json"
         )
 
@@ -1540,7 +1481,7 @@ class TestEscolherVideoContextual(unittest.TestCase):
         # aqui simulamos o provider devolvendo o já-usado primeiro para
         # confirmar que o desempate por `excluir` reordena antes da validação.
         provider = FakeMediaProviderContextual(itens_padrao=[item_ja_usado, item_novo])
-        manager = bot_main.MediaManager(
+        manager = media_service.MediaManager(
             provider=provider, provider_fallback=None, arquivo_historico="/tmp/hist_ctx_5.json"
         )
 
@@ -1582,7 +1523,7 @@ class TestEscolherVideoContextual(unittest.TestCase):
 # ===========================================================================
 class TestDiagnosticoFase2_1_1(unittest.TestCase):
     def setUp(self):
-        self.provider = bot_main.PexelsMediaProvider.__new__(bot_main.PexelsMediaProvider)
+        self.provider = media_service.PexelsMediaProvider.__new__(media_service.PexelsMediaProvider)
         self.provider.api_key = "chave-de-teste"
         self.provider.cache_dir = "/tmp/cache_teste_fase2_1_1"
         self.provider.metadata_path = "/tmp/cache_teste_fase2_1_1/metadata.json"
@@ -1612,7 +1553,7 @@ class TestDiagnosticoFase2_1_1(unittest.TestCase):
         resposta.__enter__.return_value = resposta
         resposta.__exit__.return_value = False
 
-        with mock.patch("bot_main.urllib.request.urlopen", return_value=resposta), mock.patch(
+        with mock.patch("services.media_service.urllib.request.urlopen", return_value=resposta), mock.patch(
             "builtins.print"
         ) as mock_print:
             itens = self.provider._buscar_com_fallback_de_queries(
@@ -1704,7 +1645,7 @@ class TestDiagnosticoFase2_1_1(unittest.TestCase):
             hdrs=None,
             fp=io.BytesIO(b"error code: 1010"),
         )
-        with mock.patch("bot_main.urllib.request.urlopen", side_effect=erro), mock.patch(
+        with mock.patch("services.media_service.urllib.request.urlopen", side_effect=erro), mock.patch(
             "builtins.print"
         ) as mock_print:
             itens = self.provider._buscar_com_fallback_de_queries(["q1"], duracao_alvo=6.0, ids_evitar=set())
@@ -1722,7 +1663,7 @@ class TestDiagnosticoFase2_1_1(unittest.TestCase):
             hdrs=None,
             fp=io.BytesIO(b"{}"),
         )
-        with mock.patch("bot_main.urllib.request.urlopen", side_effect=erro), mock.patch(
+        with mock.patch("services.media_service.urllib.request.urlopen", side_effect=erro), mock.patch(
             "builtins.print"
         ) as mock_print:
             itens = self.provider._buscar_com_fallback_de_queries(["q1"], duracao_alvo=6.0, ids_evitar=set())
@@ -1751,15 +1692,15 @@ class TestDiagnosticoFase2_1_1(unittest.TestCase):
     def test_componentes_do_score_somam_para_o_score_final(self):
         video = self._video(1)
         arquivo = video["video_files"][0]
-        score = bot_main._pontuar_candidato_broll(video, arquivo, 0, 4, 6.0, set())
-        c = bot_main._componentes_score_candidato_broll(video, arquivo, 0, 4, 6.0, set())
+        score = media_service._pontuar_candidato_broll(video, arquivo, 0, 4, 6.0, set())
+        c = media_service._componentes_score_candidato_broll(video, arquivo, 0, 4, 6.0, set())
         esperado = round(
             (
-                bot_main.BROLL_PESO_RELEVANCIA * c["relevancia"]
-                + bot_main.BROLL_PESO_QUALIDADE * c["qualidade"]
-                + bot_main.BROLL_PESO_ORIENTACAO * c["orientacao"]
-                + bot_main.BROLL_PESO_DURACAO * c["duracao"]
-                + bot_main.BROLL_PESO_DIVERSIDADE * c["diversidade"]
+                media_service.BROLL_PESO_RELEVANCIA * c["relevancia"]
+                + media_service.BROLL_PESO_QUALIDADE * c["qualidade"]
+                + media_service.BROLL_PESO_ORIENTACAO * c["orientacao"]
+                + media_service.BROLL_PESO_DURACAO * c["duracao"]
+                + media_service.BROLL_PESO_DIVERSIDADE * c["diversidade"]
             )
             * 100,
             2,
@@ -1775,7 +1716,7 @@ class TestDiagnosticoFase2_1_1(unittest.TestCase):
             hdrs=None,
             fp=io.BytesIO(b"chave-de-teste invalida"),
         )
-        with mock.patch("bot_main.urllib.request.urlopen", side_effect=erro), mock.patch(
+        with mock.patch("services.media_service.urllib.request.urlopen", side_effect=erro), mock.patch(
             "builtins.print"
         ) as mock_print:
             self.provider._buscar_com_fallback_de_queries(["q1"], duracao_alvo=6.0, ids_evitar=set())
@@ -1796,7 +1737,7 @@ class TestDiagnosticoFase2_1_1(unittest.TestCase):
 # ===========================================================================
 class TestListarVideosOrcamentoResidual(unittest.TestCase):
     def setUp(self):
-        self.provider = bot_main.PexelsMediaProvider.__new__(bot_main.PexelsMediaProvider)
+        self.provider = media_service.PexelsMediaProvider.__new__(media_service.PexelsMediaProvider)
         self.provider.api_key = "chave-de-teste"
         self.provider.cache_dir = "/tmp/cache_teste_orcamento_residual"
         self.provider.metadata_path = "/tmp/cache_teste_orcamento_residual/metadata.json"
@@ -1841,7 +1782,7 @@ class TestListarVideosOrcamentoResidual(unittest.TestCase):
         self.assertEqual(self.provider._downloads_nesta_execucao, 6)  # não regride nem ultrapassa
 
     def test_cache_ja_suficiente_nao_consulta_a_api_nem_gasta_orcamento(self):
-        itens_em_cache = [_media_item(f"cache{i}.mp4") for i in range(bot_main.PEXELS_MIN_DOWNLOADS_DESEJADOS)]
+        itens_em_cache = [_media_item(f"cache{i}.mp4") for i in range(media_service.PEXELS_MIN_DOWNLOADS_DESEJADOS)]
         with mock.patch.object(
             self.provider, "_videos_em_cache_validos", return_value=itens_em_cache
         ), mock.patch.object(self.provider, "_buscar") as mock_buscar, mock.patch("builtins.print"):
@@ -1884,12 +1825,12 @@ class TestMontarFundoMultiploPoolLazy(unittest.TestCase):
         manager = mock.MagicMock()
         manager.escolher_video_contextual.side_effect = ["c1.mp4", "c2.mp4"]
 
-        with mock.patch("bot_main._preparar_clip_de_fundo", return_value=FakeClip()), mock.patch(
-            "bot_main._aplicar_ken_burns", side_effect=lambda clip, *a, **k: clip
-        ), mock.patch("bot_main.concatenate_videoclips", side_effect=lambda clips, **kw: FakeClip()), mock.patch(
+        with mock.patch("services.video_service._preparar_clip_de_fundo", return_value=FakeClip()), mock.patch(
+            "services.video_service._aplicar_ken_burns", side_effect=lambda clip, *a, **k: clip
+        ), mock.patch("services.video_service.concatenate_videoclips", side_effect=lambda clips, **kw: FakeClip()), mock.patch(
             "builtins.print"
         ):
-            _, caminhos_usados = bot_main._montar_fundo_multiplo(
+            _, caminhos_usados = video_service._montar_fundo_multiplo(
                 segmentos, [], grupos, palavras, "roteiro", [], manager
             )
 
@@ -1902,16 +1843,18 @@ class TestMontarFundoMultiploPoolLazy(unittest.TestCase):
         manager.escolher_video_contextual.side_effect = ["c1.mp4", None]
         manager.escolher_videos.return_value = ["reserva.mp4"]
 
-        with mock.patch("bot_main._preparar_clip_de_fundo", return_value=FakeClip()), mock.patch(
-            "bot_main._aplicar_ken_burns", side_effect=lambda clip, *a, **k: clip
-        ), mock.patch("bot_main.concatenate_videoclips", side_effect=lambda clips, **kw: FakeClip()), mock.patch(
+        with mock.patch("services.video_service._preparar_clip_de_fundo", return_value=FakeClip()), mock.patch(
+            "services.video_service._aplicar_ken_burns", side_effect=lambda clip, *a, **k: clip
+        ), mock.patch("services.video_service.concatenate_videoclips", side_effect=lambda clips, **kw: FakeClip()), mock.patch(
             "builtins.print"
         ):
-            _, caminhos_usados = bot_main._montar_fundo_multiplo(
+            _, caminhos_usados = video_service._montar_fundo_multiplo(
                 segmentos, [], grupos, palavras, "roteiro", [], manager
             )
 
-        manager.escolher_videos.assert_called_once_with(contexto="roteiro", quantidade=bot_main.BROLL_MAX_SEGMENTOS)
+        manager.escolher_videos.assert_called_once_with(
+            contexto="roteiro", quantidade=video_service.BROLL_MAX_SEGMENTOS
+        )
         self.assertEqual(caminhos_usados, ["c1.mp4", "reserva.mp4"])
 
     def test_pool_e_buscado_apenas_uma_vez_mesmo_com_varios_trechos_sem_contextual(self):
@@ -1921,28 +1864,28 @@ class TestMontarFundoMultiploPoolLazy(unittest.TestCase):
         manager.escolher_video_contextual.return_value = None
         manager.escolher_videos.return_value = ["reserva.mp4"]
 
-        with mock.patch("bot_main._preparar_clip_de_fundo", return_value=FakeClip()), mock.patch(
-            "bot_main._aplicar_ken_burns", side_effect=lambda clip, *a, **k: clip
-        ), mock.patch("bot_main.concatenate_videoclips", side_effect=lambda clips, **kw: FakeClip()), mock.patch(
+        with mock.patch("services.video_service._preparar_clip_de_fundo", return_value=FakeClip()), mock.patch(
+            "services.video_service._aplicar_ken_burns", side_effect=lambda clip, *a, **k: clip
+        ), mock.patch("services.video_service.concatenate_videoclips", side_effect=lambda clips, **kw: FakeClip()), mock.patch(
             "builtins.print"
         ):
-            bot_main._montar_fundo_multiplo(segmentos, [], [], palavras, "roteiro", [], manager)
+            video_service._montar_fundo_multiplo(segmentos, [], [], palavras, "roteiro", [], manager)
 
         manager.escolher_videos.assert_called_once()
 
     def test_sem_media_manager_e_pool_vazio_levanta_fundo_invalido_imediatamente(self):
         segmentos, palavras, grupos = self._cenario_2_trechos()
-        with self.assertRaises(bot_main.FundoInvalidoError):
-            bot_main._montar_fundo_multiplo(segmentos, [], grupos, palavras, "roteiro", [], None)
+        with self.assertRaises(FundoInvalidoError):
+            video_service._montar_fundo_multiplo(segmentos, [], grupos, palavras, "roteiro", [], None)
 
     def test_sem_media_manager_com_pool_pre_populado_funciona_como_antes(self):
         segmentos, palavras, grupos = self._cenario_2_trechos()
-        with mock.patch("bot_main._preparar_clip_de_fundo", return_value=FakeClip()), mock.patch(
-            "bot_main._aplicar_ken_burns", side_effect=lambda clip, *a, **k: clip
-        ), mock.patch("bot_main.concatenate_videoclips", side_effect=lambda clips, **kw: FakeClip()), mock.patch(
+        with mock.patch("services.video_service._preparar_clip_de_fundo", return_value=FakeClip()), mock.patch(
+            "services.video_service._aplicar_ken_burns", side_effect=lambda clip, *a, **k: clip
+        ), mock.patch("services.video_service.concatenate_videoclips", side_effect=lambda clips, **kw: FakeClip()), mock.patch(
             "builtins.print"
         ):
-            _, caminhos_usados = bot_main._montar_fundo_multiplo(
+            _, caminhos_usados = video_service._montar_fundo_multiplo(
                 segmentos, ["pool.mp4"], grupos, palavras, "roteiro", [], None
             )
         self.assertEqual(caminhos_usados, ["pool.mp4", "pool.mp4"])
