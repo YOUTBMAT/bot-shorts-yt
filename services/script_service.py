@@ -10,6 +10,16 @@ from google.genai import types
 
 MODEL_PRIORITY = ["gemini-3.6-flash"]
 MAX_RETRIES = 2
+TEMAS_ROTEIRO = [
+    "Mistérios do Oceano",
+    "Curiosidades do Espaço",
+    "História Antiga",
+    "Invenções Bizarras",
+    "Animais Estranhos",
+    "Civilizações Perdidas",
+    "Curiosidades da Natureza",
+    "Física Quântica para leigos",
+]
 ROTEIRO_MIN_PALAVRAS = 65
 ROTEIRO_MAX_PALAVRAS = 85
 ROTEIRO_TOLERANCIA_PALAVRAS = 15
@@ -20,15 +30,14 @@ RETRY_BACKOFF_JITTER = 0.5
 
 def _montar_prompt_roteiro() -> str:
     """Monta o prompt que instrui o Gemini a atuar como roteirista viral."""
+    tema = random.choice(TEMAS_ROTEIRO)
     return f"""
 Você é um roteirista profissional especializado em vídeos virais para YouTube
 Shorts. Seu único objetivo é prender a atenção do espectador do primeiro ao
 último segundo.
 
-Gere UMA curiosidade fascinante e verdadeira sobre um dos temas abaixo,
-alternando bastante entre eles e evitando assuntos já muito repetidos:
-espaço, história, natureza, ciência, animais, corpo humano, oceanos ou
-tecnologia.
+Gere UMA curiosidade fascinante e verdadeira sobre o tema "{tema}".
+Mantenha o roteiro focado nesse tema e evite assuntos já muito repetidos.
 
 Estruture o roteiro mentalmente seguindo este ritmo (não escreva os tempos,
 apenas siga a lógica):

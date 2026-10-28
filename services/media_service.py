@@ -62,7 +62,8 @@ MEDIA_MAX_TENTATIVAS: int = 3  # quantos arquivos diferentes tentar antes de des
 PEXELS_API_KEY_ENV_VAR: str = "PEXELS_API_KEY"
 PEXELS_API_URL: str = "https://api.pexels.com/videos/search"
 PEXELS_MAX_RESULTS: int = 15  # quantos resultados pedir na busca (antes de filtrar/baixar)
-PEXELS_MAX_DOWNLOADS: int = 6  # nunca baixa mais que isso por execução (pedido: entre 4 e 6)
+PEXELS_MAX_DOWNLOADS: int = 15  # teto global de downloads novos por execução
+PEXELS_MAX_DOWNLOADS_POR_TRECHO: int = 2  # evita consumir a cota em um único trecho contextual
 PEXELS_MIN_DOWNLOADS_DESEJADOS: int = 4
 PEXELS_TIMEOUT_SECONDS: float = 15.0  # por requisição (busca OU download de 1 arquivo)
 PEXELS_ORIENTACAO: str = "landscape"  # priorizamos 16:9, cortado depois para 9:16 no pipeline
@@ -1279,6 +1280,8 @@ class PexelsMediaProvider(MediaProvider):
         baixados_agora = 0
         falhas_download = 0
         bloqueados_por_teto_download = 0
+        bloqueados_por_teto_trecho = 0
+        downloads_neste_trecho = 0
 
         for score, video, arquivo, video_id, query_origem, _indice_q in candidatos_pontuados:
             if video_id in vistos:
@@ -1303,8 +1306,13 @@ class PexelsMediaProvider(MediaProvider):
                 bloqueados_por_teto_download += 1
                 continue  # teto de downloads da execução (item 19) — mesmo com candidatos bons sobrando
 
+            if downloads_neste_trecho >= PEXELS_MAX_DOWNLOADS_POR_TRECHO:
+                bloqueados_por_teto_trecho += 1
+                continue  # mantém os downloads novos deste trecho dentro do orçamento local
+
             print(f"⬇️ Download novo (video_id={video_id}, fonte=api, url={arquivo.get('link', '?')})")
             destino = os.path.join(self.cache_dir, f"{video_id}.mp4")
+            downloads_neste_trecho += 1
             if not self._baixar_arquivo(arquivo["link"], destino):
                 falhas_download += 1
                 print(f"❌ Download falhou (video_id={video_id})")
@@ -1338,6 +1346,7 @@ class PexelsMediaProvider(MediaProvider):
             f"baixados_agora={baixados_agora} "
             f"falhas_download={falhas_download} "
             f"bloqueados_por_teto_download={bloqueados_por_teto_download} "
+            f"bloqueados_por_teto_trecho={bloqueados_por_teto_trecho} "
             f"-> itens_finais={len(itens)}"
         )
 

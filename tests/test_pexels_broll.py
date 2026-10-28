@@ -1365,7 +1365,6 @@ class TestBuscarComFallbackDeQueries(unittest.TestCase):
         self.assertEqual(chamadas, ["q1"])
 
     def test_respeita_teto_de_downloads_da_execucao(self):
-        media_service.PEXELS_MAX_DOWNLOADS
         self.provider._downloads_nesta_execucao = media_service.PEXELS_MAX_DOWNLOADS  # já no teto
 
         with mock.patch.object(self.provider, "_buscar", return_value=[self._video(1)]), mock.patch.object(
@@ -1375,6 +1374,18 @@ class TestBuscarComFallbackDeQueries(unittest.TestCase):
 
         mock_baixar.assert_not_called()
         self.assertEqual(itens, [])
+
+    def test_limita_downloads_novos_a_dois_por_trecho(self):
+        videos = [self._video(video_id) for video_id in range(1, 6)]
+        with mock.patch.object(self.provider, "_buscar", return_value=videos), mock.patch.object(
+            self.provider, "_baixar_arquivo", return_value=True
+        ) as mock_baixar, mock.patch.object(self.provider, "_salvar_metadata"):
+            itens = self.provider._buscar_com_fallback_de_queries(
+                ["q1"], duracao_alvo=6.0, ids_evitar=set()
+            )
+
+        self.assertEqual(mock_baixar.call_count, media_service.PEXELS_MAX_DOWNLOADS_POR_TRECHO)
+        self.assertEqual(len(itens), media_service.PEXELS_MAX_DOWNLOADS_POR_TRECHO)
 
     def test_resultados_voltam_ordenados_por_score_decrescente(self):
         def fake_buscar(query):
@@ -1772,9 +1783,8 @@ class TestListarVideosOrcamentoResidual(unittest.TestCase):
         }
 
     def test_baixa_ate_o_orcamento_residual_mesmo_com_mais_candidatos_disponiveis(self):
-        # PEXELS_MAX_DOWNLOADS=6, mas 4 já foram gastos alhures (pelo
-        # contextual, por exemplo) nesta mesma execução -> só sobram 2.
-        self.provider._downloads_nesta_execucao = 4
+        # Só há orçamento residual de 2 downloads, apesar do teto global maior.
+        self.provider._downloads_nesta_execucao = media_service.PEXELS_MAX_DOWNLOADS - 2
         videos = [self._video(i) for i in range(1, 6)]  # 5 candidatos válidos disponíveis
 
         with mock.patch.object(self.provider, "_buscar", return_value=videos), mock.patch.object(
@@ -1782,18 +1792,20 @@ class TestListarVideosOrcamentoResidual(unittest.TestCase):
         ), mock.patch.object(self.provider, "_salvar_metadata"), mock.patch("builtins.print"):
             resultado = self.provider.listar_videos(contexto="roteiro qualquer")
 
-        self.assertEqual(len(resultado), 2)  # não 5, respeitou o orçamento residual (6-4=2)
-        self.assertEqual(self.provider._downloads_nesta_execucao, 6)  # nunca ultrapassa PEXELS_MAX_DOWNLOADS
+        self.assertEqual(len(resultado), 2)  # não 5, respeitou o orçamento residual
+        self.assertEqual(self.provider._downloads_nesta_execucao, media_service.PEXELS_MAX_DOWNLOADS)
 
     def test_orcamento_zerado_nao_consulta_a_api(self):
-        self.provider._downloads_nesta_execucao = 6  # já no teto global
+        self.provider._downloads_nesta_execucao = media_service.PEXELS_MAX_DOWNLOADS  # já no teto global
 
         with mock.patch.object(self.provider, "_buscar") as mock_buscar, mock.patch("builtins.print"):
             resultado = self.provider.listar_videos(contexto="roteiro qualquer")
 
         mock_buscar.assert_not_called()  # nem tenta: não há orçamento pra baixar nada mesmo
         self.assertEqual(resultado, [])
-        self.assertEqual(self.provider._downloads_nesta_execucao, 6)  # não regride nem ultrapassa
+        self.assertEqual(
+            self.provider._downloads_nesta_execucao, media_service.PEXELS_MAX_DOWNLOADS
+        )  # não regride nem ultrapassa
 
     def test_cache_ja_suficiente_nao_consulta_a_api_nem_gasta_orcamento(self):
         itens_em_cache = [_media_item(f"cache{i}.mp4") for i in range(media_service.PEXELS_MIN_DOWNLOADS_DESEJADOS)]
@@ -1808,7 +1820,7 @@ class TestListarVideosOrcamentoResidual(unittest.TestCase):
 
     def test_cache_hits_nao_consomem_orcamento_mesmo_misturados_com_novos(self):
         # 1 já em cache (grátis) + candidatos novos, com orçamento residual = 2
-        self.provider._downloads_nesta_execucao = 4
+        self.provider._downloads_nesta_execucao = media_service.PEXELS_MAX_DOWNLOADS - 2
         self.provider._metadata = {
             "9": {"caminho": "/tmp/cache_teste_orcamento_residual/9.mp4", "baixado_em": time.time(), "query": "x"}
         }
@@ -1825,7 +1837,7 @@ class TestListarVideosOrcamentoResidual(unittest.TestCase):
 
         # 1 do cache (grátis) + no máximo 2 novos (orçamento residual) = 3
         self.assertEqual(len(resultado), 3)
-        self.assertEqual(self.provider._downloads_nesta_execucao, 6)
+        self.assertEqual(self.provider._downloads_nesta_execucao, media_service.PEXELS_MAX_DOWNLOADS)
 
 
 class TestMontarFundoMultiploPoolLazy(unittest.TestCase):
