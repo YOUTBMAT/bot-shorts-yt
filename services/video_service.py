@@ -5,6 +5,7 @@ import math
 import os
 import random
 import re
+import subprocess
 import time
 import unicodedata
 from dataclasses import dataclass
@@ -235,9 +236,34 @@ def transcrever_narracao(caminho_audio: str) -> List[PalavraLegenda]:
     inicio = time.perf_counter()
 
     try:
+        audio_decodificado = subprocess.run(
+            [
+                "ffmpeg",
+                "-nostdin",
+                "-v",
+                "error",
+                "-i",
+                os.path.abspath(caminho_audio),
+                "-f",
+                "f32le",
+                "-acodec",
+                "pcm_f32le",
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "pipe:1",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        audio = np.frombuffer(audio_decodificado.stdout, dtype=np.float32)
+        if audio.size == 0:
+            raise ValueError("O FFmpeg não retornou amostras de áudio.")
+
         modelo = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type=WHISPER_COMPUTE_TYPE)
         segmentos, _info = modelo.transcribe(
-            caminho_audio,
+            audio,
             language=WHISPER_LANGUAGE,
             word_timestamps=True,
             vad_filter=True,
