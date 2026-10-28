@@ -1726,11 +1726,12 @@ def _criar_media_manager() -> MediaManager:
     o fallback automático; caso contrário, só Local (comportamento
     idêntico ao da Fase 5). Centraliza essa decisão aqui para que `main()`
     não precise saber nada sobre providers."""
-    api_key = os.environ.get(PEXELS_API_KEY_ENV_VAR)
+    api_key = os.getenv(PEXELS_API_KEY_ENV_VAR)
+    provider_local = LocalMediaProvider()
     if not api_key:
-        return MediaManager(provider=LocalMediaProvider())
+        return MediaManager(provider=provider_local)
 
     return MediaManager(
         provider=PexelsMediaProvider(api_key=api_key),
-        provider_fallback=LocalMediaProvider(),
+        provider_fallback=provider_local,
     )

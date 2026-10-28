@@ -522,6 +522,20 @@ class TestFallbackPexelsParaLocal(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             manager.escolher_video(contexto="qualquer roteiro")
 
+    def test_factory_usa_provedores_reais_pexels_e_local(self):
+        with mock.patch.dict(os.environ, {"PEXELS_API_KEY": "chave-de-teste"}):
+            manager = media_service._criar_media_manager()
+
+        self.assertIsInstance(manager.provider, media_service.PexelsMediaProvider)
+        self.assertIsInstance(manager.provider_fallback, media_service.LocalMediaProvider)
+
+    def test_factory_sem_chave_usa_provedor_local_real(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            manager = media_service._criar_media_manager()
+
+        self.assertIsInstance(manager.provider, media_service.LocalMediaProvider)
+        self.assertIsNone(manager.provider_fallback)
+
 
 # ===========================================================================
 # 4-6. escolher_videos() com pools de tamanhos diferentes
